@@ -289,38 +289,41 @@ def summarize_with_gemini(client, item: Dict[str, Any]) -> Dict[str, str]:
 
     prompt = f"""
 prompt = f"""
+prompt = f"""
 Bạn là biên tập viên bản tin crypto tiếng Việt chuyên nghiệp.
 
 Nhiệm vụ:
 Chuyển toàn bộ nội dung bài báo sang tiếng Việt tự nhiên, dễ đọc như báo chí.
 
-Yêu cầu cực kỳ quan trọng:
+Yêu cầu:
 - KHÔNG giữ lại tiếng Anh (trừ tên riêng: Bitcoin, Ethereum, SEC...)
 - KHÔNG copy câu tiếng Anh gốc
 - Viết lại hoàn toàn bằng tiếng Việt
 - Văn phong giống báo tài chính / crypto
 
-Chi tiết output:
-
 1. title_vi:
-- Viết lại tiêu đề hoàn toàn bằng tiếng Việt
+- Viết lại tiêu đề tiếng Việt tự nhiên
 - Ngắn gọn, hấp dẫn
 - Tối đa 110 ký tự
 
 2. summary_vi:
-- Viết 2–3 câu tiếng Việt
-- Diễn giải lại nội dung, KHÔNG dịch từng chữ
-- Dễ hiểu, mượt, không lẫn tiếng Anh
-- Độ dài khoảng 60–100 từ
+- Viết 2-3 câu tiếng Việt
+- Dài khoảng 60-100 từ
+- Không lẫn tiếng Anh
+- Viết lại nội dung, không dịch từng chữ
 
 3. impact_vi:
 - 1 câu tiếng Việt
-- Giải thích vì sao tin này quan trọng với thị trường
+- Giải thích vì sao tin này quan trọng
 
 4. tag_line:
-- 2–5 từ tiếng Việt
-- Ví dụ: "Biến động giá", "Hack giao thức", "ETF", "Tin pháp lý"
+- 2-5 từ tiếng Việt
+- Ví dụ: "ETF", "Hack", "Biến động giá"
 
+Dữ liệu:
+TITLE: {item['title']}
+CONTENT: {item['summary']}
+"""
 Dữ liệu bài báo:
 TITLE: {item['title']}
 CATEGORY: {item['category']}
