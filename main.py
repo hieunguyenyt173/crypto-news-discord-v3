@@ -288,7 +288,45 @@ def summarize_with_gemini(client, item: Dict[str, Any]) -> Dict[str, str]:
     )
 
     prompt = f"""
-Bạn là biên tập viên bản tin crypto tiếng Việt.
+prompt = f"""
+Bạn là biên tập viên bản tin crypto tiếng Việt chuyên nghiệp.
+
+Nhiệm vụ:
+Chuyển toàn bộ nội dung bài báo sang tiếng Việt tự nhiên, dễ đọc như báo chí.
+
+Yêu cầu cực kỳ quan trọng:
+- KHÔNG giữ lại tiếng Anh (trừ tên riêng: Bitcoin, Ethereum, SEC...)
+- KHÔNG copy câu tiếng Anh gốc
+- Viết lại hoàn toàn bằng tiếng Việt
+- Văn phong giống báo tài chính / crypto
+
+Chi tiết output:
+
+1. title_vi:
+- Viết lại tiêu đề hoàn toàn bằng tiếng Việt
+- Ngắn gọn, hấp dẫn
+- Tối đa 110 ký tự
+
+2. summary_vi:
+- Viết 2–3 câu tiếng Việt
+- Diễn giải lại nội dung, KHÔNG dịch từng chữ
+- Dễ hiểu, mượt, không lẫn tiếng Anh
+- Độ dài khoảng 60–100 từ
+
+3. impact_vi:
+- 1 câu tiếng Việt
+- Giải thích vì sao tin này quan trọng với thị trường
+
+4. tag_line:
+- 2–5 từ tiếng Việt
+- Ví dụ: "Biến động giá", "Hack giao thức", "ETF", "Tin pháp lý"
+
+Dữ liệu bài báo:
+TITLE: {item['title']}
+CATEGORY: {item['category']}
+SOURCE: {item['source']}
+CONTENT: {item['summary']}
+"""
 Nhiệm vụ: viết bản tóm tắt ngắn gọn nhưng tự nhiên, dễ đọc trong Discord.
 
 Yêu cầu:
