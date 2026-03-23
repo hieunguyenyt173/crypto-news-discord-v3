@@ -288,8 +288,6 @@ def summarize_with_gemini(client, item: Dict[str, Any]) -> Dict[str, str]:
     )
 
     prompt = f"""
-prompt = f"""
-prompt = f"""
 Bạn là biên tập viên bản tin crypto tiếng Việt chuyên nghiệp.
 
 Nhiệm vụ:
