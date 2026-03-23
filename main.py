@@ -20,9 +20,9 @@ from google.genai import types
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
-LOOKBACK_HOURS = int(os.getenv("LOOKBACK_HOURS", "12"))
-MAX_ITEMS = int(os.getenv("MAX_ITEMS", "8"))
-MAX_PER_CATEGORY = int(os.getenv("MAX_PER_CATEGORY", "2"))
+LOOKBACK_HOURS = int(os.getenv("LOOKBACK_HOURS", "24"))
+MAX_ITEMS = int(os.getenv("MAX_ITEMS", "12"))
+MAX_PER_CATEGORY = int(os.getenv("MAX_PER_CATEGORY", "3"))
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
 
 STATE_FILE = "posted_state.json"
