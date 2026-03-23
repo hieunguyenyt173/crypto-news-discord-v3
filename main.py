@@ -28,7 +28,6 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
 STATE_FILE = "posted_state.json"
 SOURCES_FILE = "sources.json"
 
-# Discord embed color
 EMBED_COLOR = 3447003
 
 CATEGORY_RULES = {
@@ -70,7 +69,7 @@ CATEGORY_EMOJI = {
 
 
 # =========================
-# Pydantic schemas for Gemini structured output
+# Pydantic schema
 # =========================
 class NewsSummary(BaseModel):
     title_vi: str
@@ -80,7 +79,7 @@ class NewsSummary(BaseModel):
 
 
 # =========================
-# Utils
+# Basic helpers
 # =========================
 def load_sources() -> List[Dict[str, str]]:
     with open(SOURCES_FILE, "r", encoding="utf-8") as f:
@@ -143,11 +142,21 @@ def parse_entry_time(entry) -> Optional[datetime]:
     return None
 
 
-def format_time_bangkok(dt_utc: datetime) -> str:
-    bangkok = timezone(timedelta(hours=7))
-    return dt_utc.astimezone(bangkok).strftime("%d/%m %H:%M ICT")
+def format_time_vn(dt_utc: datetime) -> str:
+    vn_tz = timezone(timedelta(hours=7))
+    return dt_utc.astimezone(vn_tz).strftime("%d/%m %H:%M ICT")
 
 
+def truncate_text(text: str, max_len: int) -> str:
+    text = (text or "").strip()
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 3].rstrip() + "..."
+
+
+# =========================
+# Categorize and score
+# =========================
 def categorize_article(title: str, summary: str) -> str:
     text = f"{title} {summary}".lower()
     scores = {}
@@ -159,8 +168,8 @@ def categorize_article(title: str, summary: str) -> str:
                 score += 1
         scores[category] = score
 
-    best = max(scores, key=scores.get)
-    return best if scores[best] > 0 else "General"
+    best_category = max(scores, key=scores.get)
+    return best_category if scores[best_category] > 0 else "General"
 
 
 def score_article(title: str, summary: str, category: str) -> int:
@@ -172,6 +181,7 @@ def score_article(title: str, summary: str, category: str) -> int:
         "hack", "exploit", "etf", "sec", "listing", "airdrop",
         "mainnet", "lawsuit", "liquidation", "whale"
     ]
+
     for word in hot_words:
         if word in text:
             score += 2
@@ -231,10 +241,10 @@ def fetch_articles() -> List[Dict[str, Any]]:
             }
             all_items.append(item)
 
-    # dedupe by link
     dedup = {}
     for item in all_items:
-        if item["link"] not in dedup or item["score"] > dedup[item["link"]]["score"]:
+        old = dedup.get(item["link"])
+        if old is None or item["score"] > old["score"]:
             dedup[item["link"]] = item
 
     items = list(dedup.values())
@@ -243,7 +253,7 @@ def fetch_articles() -> List[Dict[str, Any]]:
 
 
 # =========================
-# Gemini Summarization
+# Gemini
 # =========================
 def build_gemini_client():
     if not GEMINI_API_KEY:
@@ -252,27 +262,26 @@ def build_gemini_client():
 
 
 def fallback_summary_vi(item: Dict[str, Any]) -> Dict[str, str]:
-    base = item["summary"] or item["title"]
-    base = base[:260].strip()
-
-    prefix_map = {
-        "Market": "Tin thị trường:",
-        "Regulation": "Điểm pháp lý:",
-        "DeFi": "Diễn biến DeFi:",
-        "Security": "Cảnh báo bảo mật:",
-        "Alt & Ecosystem": "Cập nhật hệ sinh thái:",
-        "General": "Tin đáng chú ý:"
+    category_prefix = {
+        "Market": "Tin thị trường",
+        "Regulation": "Tin pháp lý",
+        "DeFi": "Diễn biến DeFi",
+        "Security": "Cảnh báo bảo mật",
+        "Alt & Ecosystem": "Cập nhật hệ sinh thái",
+        "General": "Tin đáng chú ý"
     }
 
-    prefix = prefix_map.get(item["category"], "Tin đáng chú ý:")
-    summary_vi = f"{prefix} {base}"
+    base_summary = item["summary"] or item["title"]
+    base_summary = truncate_text(base_summary, 220)
+
+    summary_vi = f"{category_prefix.get(item['category'], 'Tin đáng chú ý')}: {base_summary}"
     if not summary_vi.endswith("."):
         summary_vi += "."
 
     return {
         "title_vi": item["title"],
         "summary_vi": summary_vi,
-        "impact_vi": "Tác động thị trường cần theo dõi thêm.",
+        "impact_vi": "Đây là diễn biến đáng chú ý để người theo dõi thị trường tiếp tục quan sát.",
         "tag_line": item["category"]
     }
 
@@ -291,67 +300,33 @@ def summarize_with_gemini(client, item: Dict[str, Any]) -> Dict[str, str]:
 Bạn là biên tập viên bản tin crypto tiếng Việt chuyên nghiệp.
 
 Nhiệm vụ:
-Chuyển toàn bộ nội dung bài báo sang tiếng Việt tự nhiên, dễ đọc như báo chí.
+Chuyển toàn bộ nội dung bài báo sang tiếng Việt tự nhiên, dễ đọc như một bản tin ngắn trên Discord.
 
-Yêu cầu:
-- KHÔNG giữ lại tiếng Anh (trừ tên riêng: Bitcoin, Ethereum, SEC...)
-- KHÔNG copy câu tiếng Anh gốc
-- Viết lại hoàn toàn bằng tiếng Việt
-- Văn phong giống báo tài chính / crypto
+Yêu cầu rất quan trọng:
+- Không giữ lại câu tiếng Anh trong phần tóm tắt, trừ tên riêng như Bitcoin, Ethereum, SEC, ETF.
+- Không chép nguyên văn câu gốc.
+- Không bịa thêm dữ kiện không có trong tiêu đề hoặc đoạn trích.
+- Viết rõ ràng, tự nhiên, gọn, đúng ý.
 
-1. title_vi:
-- Viết lại tiêu đề tiếng Việt tự nhiên
-- Ngắn gọn, hấp dẫn
-- Tối đa 110 ký tự
+Hãy trả về đúng 4 trường sau:
 
-2. summary_vi:
-- Viết 2-3 câu tiếng Việt
-- Dài khoảng 60-100 từ
-- Không lẫn tiếng Anh
-- Viết lại nội dung, không dịch từng chữ
+1. title_vi
+- Viết lại tiêu đề hoàn toàn bằng tiếng Việt.
+- Tự nhiên, dễ hiểu, tối đa 110 ký tự.
 
-3. impact_vi:
-- 1 câu tiếng Việt
-- Giải thích vì sao tin này quan trọng
+2. summary_vi
+- Viết 2-3 câu tiếng Việt.
+- Dài khoảng 60-100 từ.
+- Tóm tắt lại nội dung theo văn phong bản tin.
+- Không lẫn tiếng Anh.
 
-4. tag_line:
-- 2-5 từ tiếng Việt
-- Ví dụ: "ETF", "Hack", "Biến động giá"
+3. impact_vi
+- Viết 1 câu tiếng Việt ngắn.
+- Giải thích vì sao tin này đáng chú ý với người theo dõi thị trường crypto.
 
-Dữ liệu:
-TITLE: {item['title']}
-CONTENT: {item['summary']}
-"""
-Dữ liệu bài báo:
-TITLE: {item['title']}
-CATEGORY: {item['category']}
-SOURCE: {item['source']}
-CONTENT: {item['summary']}
-"""
-Nhiệm vụ: viết bản tóm tắt ngắn gọn nhưng tự nhiên, dễ đọc trong Discord.
-
-Yêu cầu:
-1. title_vi:
-- Viết lại tiêu đề tiếng Việt tự nhiên.
-- Không dịch máy cứng.
-- Tối đa 110 ký tự.
-
-2. summary_vi:
-- Viết 2 câu tiếng Việt, tự nhiên, rõ ý.
-- Dài khoảng 45 đến 85 từ.
-- Chỉ dùng thông tin có trong tiêu đề và đoạn trích.
-- Không bịa số liệu, không suy đoán vô căn cứ.
-- Giữ giọng điệu như một bản tin ngắn.
-
-3. impact_vi:
-- 1 câu ngắn 12 đến 24 từ.
-- Nói vì sao tin này đáng chú ý với người theo dõi crypto.
-
-4. tag_line:
-- 2 đến 5 từ tiếng Việt, kiểu nhãn ngắn.
-- Ví dụ: "ETF", "Hack giao thức", "Biến động giá", "Cập nhật hệ sinh thái"
-
-Nếu thông tin ít, vẫn viết ngắn gọn, sạch, không lan man.
+4. tag_line
+- Viết nhãn ngắn 2-5 từ bằng tiếng Việt.
+- Ví dụ: "Biến động giá", "Hack giao thức", "Cập nhật ETF", "Tin pháp lý"
 
 Dữ liệu bài báo:
 {text_block}
@@ -362,7 +337,7 @@ Dữ liệu bài báo:
             model=GEMINI_MODEL,
             contents=prompt,
             config=types.GenerateContentConfig(
-                temperature=0.5,
+                temperature=0.4,
                 response_mime_type="application/json",
                 response_schema=NewsSummary,
                 max_output_tokens=500,
@@ -390,21 +365,22 @@ def enrich_articles_with_ai(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]
     enriched = []
 
     for item in items:
-        ai = summarize_with_gemini(client, item) if client else fallback_summary_vi(item)
-        item["title_vi"] = ai["title_vi"]
-        item["summary_vi"] = ai["summary_vi"]
-        item["impact_vi"] = ai["impact_vi"]
-        item["tag_line"] = ai["tag_line"]
+        ai_result = summarize_with_gemini(client, item) if client else fallback_summary_vi(item)
+        item["title_vi"] = ai_result["title_vi"]
+        item["summary_vi"] = ai_result["summary_vi"]
+        item["impact_vi"] = ai_result["impact_vi"]
+        item["tag_line"] = ai_result["tag_line"]
         enriched.append(item)
 
     return enriched
 
 
 # =========================
-# Discord Payload
+# Discord formatting
 # =========================
 def group_items(items: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
-    grouped = {}
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+
     for item in items:
         grouped.setdefault(item["category"], []).append(item)
 
@@ -417,34 +393,36 @@ def group_items(items: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
 
 def build_embed_fields(grouped: Dict[str, List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
     ordered_categories = ["Market", "Regulation", "DeFi", "Security", "Alt & Ecosystem", "General"]
-    fields = []
+    fields: List[Dict[str, Any]] = []
 
     for category in ordered_categories:
         if category not in grouped:
             continue
 
         emoji = CATEGORY_EMOJI.get(category, "📰")
-        lines = []
+        blocks = []
 
         for item in grouped[category]:
-            title_vi = item.get("title_vi", item["title"])
-            if len(title_vi) > 100:
-                title_vi = title_vi[:97] + "..."
+            title_vi = truncate_text(item.get("title_vi", item["title"]), 100)
+            summary_vi = truncate_text(item.get("summary_vi", item["summary"]), 320)
+            impact_vi = truncate_text(item.get("impact_vi", "Đáng chú ý để tiếp tục theo dõi."), 120)
+            tag_line = truncate_text(item.get("tag_line", category), 30)
 
             block = (
                 f"**[{title_vi}]({item['link']})**\n"
-                f"*{item.get('tag_line', category)}*\n"
-                f"{item.get('summary_vi', item['summary'][:220])}\n"
-                f"↳ {item.get('impact_vi', 'Đáng để theo dõi thêm.')}\n"
-                f"`{item['source']}` • {format_time_bangkok(item['published_at'])}"
+                f"*{tag_line}*\n"
+                f"{summary_vi}\n"
+                f"↳ {impact_vi}\n"
+                f"`{item['source']}` • {format_time_vn(item['published_at'])}"
             )
+            blocks.append(block)
 
-            # Discord field value limit 1024 chars
-            lines.append(block[:950])
+        field_value = "\n\n".join(blocks)
+        field_value = truncate_text(field_value, 1024)
 
         fields.append({
             "name": f"{emoji} {category}",
-            "value": "\n\n".join(lines)[:1024],
+            "value": field_value,
             "inline": False
         })
 
@@ -453,18 +431,18 @@ def build_embed_fields(grouped: Dict[str, List[Dict[str, Any]]]) -> List[Dict[st
 
 def chunk_list(arr: List[Any], n: int):
     for i in range(0, len(arr), n):
-        yield arr[i:i+n]
+        yield arr[i:i + n]
 
 
 def build_discord_payload(items: List[Dict[str, Any]]) -> Dict[str, Any]:
-    now_bkk = datetime.now(timezone(timedelta(hours=7))).strftime("%d/%m/%Y %H:%M ICT")
+    now_vn = datetime.now(timezone(timedelta(hours=7))).strftime("%d/%m/%Y %H:%M ICT")
 
     if not items:
         return {
             "content": "📰 **Bản tin crypto 2 kỳ mỗi ngày**",
             "embeds": [
                 {
-                    "title": f"Crypto Daily Brief | {now_bkk}",
+                    "title": f"Crypto Daily Brief | {now_vn}",
                     "description": f"Không có tin mới nổi bật trong {LOOKBACK_HOURS} giờ gần đây.",
                     "color": EMBED_COLOR,
                 }
@@ -477,10 +455,10 @@ def build_discord_payload(items: List[Dict[str, Any]]) -> Dict[str, Any]:
 
     for idx, field_group in enumerate(chunk_list(fields, 3), start=1):
         embed = {
-            "title": f"Crypto Daily Brief | {now_bkk}" if idx == 1 else f"Crypto Daily Brief | phần {idx}",
+            "title": f"Crypto Daily Brief | {now_vn}" if idx == 1 else f"Crypto Daily Brief | phần {idx}",
             "description": (
                 f"Tổng hợp tin crypto trong {LOOKBACK_HOURS} giờ gần nhất.\n"
-                f"Tóm tắt bằng tiếng Việt để bạn lướt nhanh như đọc headline trên tàu lượn nến 📉📈"
+                f"Tóm tắt tiếng Việt để bạn đọc nhanh, gọn và đỡ rối giữa dòng tin."
             ) if idx == 1 else "Tiếp tục bản tin.",
             "color": EMBED_COLOR,
             "fields": field_group,
@@ -501,15 +479,15 @@ def send_to_discord(payload: Dict[str, Any]) -> None:
     if not DISCORD_WEBHOOK_URL:
         raise ValueError("Missing DISCORD_WEBHOOK_URL")
 
-    res = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=30)
-    if res.status_code not in (200, 204):
-        raise RuntimeError(f"Discord webhook failed: {res.status_code} | {res.text}")
+    response = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=30)
+    if response.status_code not in (200, 204):
+        raise RuntimeError(f"Discord webhook failed: {response.status_code} | {response.text}")
 
 
 # =========================
 # Main
 # =========================
-def main():
+def main() -> None:
     state = load_state()
     posted_ids = set(state.get("posted_ids", []))
 
@@ -526,7 +504,7 @@ def main():
     payload = build_discord_payload(enriched_items)
     send_to_discord(payload)
 
-    for item in new_items:
+    for item in new_items[:MAX_ITEMS]:
         posted_ids.add(item["id"])
 
     state["posted_ids"] = list(posted_ids)[-1500:]
