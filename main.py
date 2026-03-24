@@ -10,7 +10,6 @@ from email.utils import parsedate_to_datetime
 
 import feedparser
 import requests
-from pydantic import BaseModel
 from google import genai
 from google.genai import types
 
@@ -28,7 +27,7 @@ DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
 LOOKBACK_HOURS = int(os.getenv("LOOKBACK_HOURS", "12"))
-MAX_ITEMS = int(os.getenv("MAX_ITEMS", "10"))
+MAX_ITEMS = int(os.getenv("MAX_ITEMS", "8"))
 MAX_PER_CATEGORY = int(os.getenv("MAX_PER_CATEGORY", "3"))
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
 TEST_MODE = os.getenv("TEST_MODE", "false").lower() == "true"
@@ -88,24 +87,6 @@ CATEGORY_EMOJI = {
     "General": "📰"
 }
 
-TAGLINE_MAP_VI = {
-    "Market": "Biến động thị trường",
-    "Regulation": "Tin pháp lý",
-    "DeFi": "Cập nhật DeFi",
-    "Security": "Cảnh báo bảo mật",
-    "Alt & Ecosystem": "Cập nhật hệ sinh thái",
-    "General": "Tin đáng chú ý"
-}
-
-
-# =========================
-# SCHEMA
-# =========================
-class NewsSummary(BaseModel):
-    title_vi: str
-    summary_vi: str
-    tag_line: str
-
 
 # =========================
 # FILE / STATE HELPERS
@@ -155,59 +136,32 @@ def truncate_text(text: str, max_len: int) -> str:
     return text[: max_len - 3].rstrip() + "..."
 
 
-def clean_summary(text: str) -> str:
+def cleanup_digest_text(text: str) -> str:
     if not text:
         return ""
 
-    text = text.strip()
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
 
     banned_patterns = [
-        r"Đây là diễn biến đáng chú ý[^.]*\.",
-        r"Nhà đầu tư nên tiếp tục theo dõi[^.]*\.",
-        r"Đây là thông tin quan trọng[^.]*\.",
-        r"Đáng chú ý để tiếp tục theo dõi[^.]*\.",
-        r"Tin thị trường:\s*",
-        r"Tin pháp lý:\s*",
-        r"Diễn biến DeFi:\s*",
-        r"Cảnh báo bảo mật:\s*",
-        r"Cập nhật hệ sinh thái:\s*",
-        r"Tin đáng chú ý:\s*",
+        r"Đây là diễn biến đáng chú ý[^.\n]*\.?",
+        r"Nhà đầu tư nên tiếp tục theo dõi[^.\n]*\.?",
+        r"Đây là thông tin quan trọng[^.\n]*\.?",
+        r"Tin đáng chú ý[^.\n]*\.?",
     ]
-
     for pattern in banned_patterns:
         text = re.sub(pattern, "", text, flags=re.IGNORECASE)
 
-    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
     return text
-
-
-def clean_title(text: str) -> str:
-    if not text:
-        return ""
-    text = re.sub(r"\s+", " ", text).strip(" -–—:|")
-    return truncate_text(text, 110)
-
-
-def is_mostly_english(text: str) -> bool:
-    if not text:
-        return False
-
-    text = text.strip()
-    ascii_letters = len(re.findall(r"[A-Za-z]", text))
-    vi_letters = len(re.findall(
-        r"[ăâđêôơưáàảãạấầẩẫậắằẳẵặéèẻẽẹếềểễệíìỉĩịóòỏõọốồổỗộớờởỡợúùủũụứừửữựýỳỷỹỵ]",
-        text.lower()
-    ))
-
-    if ascii_letters < 6:
-        return False
-
-    return vi_letters == 0
 
 
 def format_time_vn(dt_utc: datetime) -> str:
     vn_tz = timezone(timedelta(hours=7))
     return dt_utc.astimezone(vn_tz).strftime("%d/%m %H:%M ICT")
+
+
+def now_vn_str() -> str:
+    return datetime.now(timezone(timedelta(hours=7))).strftime("%d/%m/%Y %H:%M ICT")
 
 
 # =========================
@@ -321,7 +275,7 @@ def fetch_articles() -> List[Dict[str, Any]]:
                 "source": source_name,
                 "title": title,
                 "link": normalize_url(link),
-                "summary": clean_snippet,
+                "summary": truncate_text(clean_snippet, 700),
                 "published_at": published_at,
                 "category": category,
                 "score": score,
@@ -336,11 +290,45 @@ def fetch_articles() -> List[Dict[str, Any]]:
 
     items = list(dedup_by_link.values())
     items.sort(key=lambda x: (x["score"], x["published_at"]), reverse=True)
-    return items[:MAX_ITEMS]
+    return items
+
+
+def limit_items_balanced(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    grouped: Dict[str, List[Dict[str, Any]]] = {}
+    ordered_categories = ["Market", "Regulation", "DeFi", "Security", "Alt & Ecosystem", "General"]
+
+    for item in items:
+        grouped.setdefault(item["category"], []).append(item)
+
+    selected: List[Dict[str, Any]] = []
+
+    for category in ordered_categories:
+        if category not in grouped:
+            continue
+        bucket = sorted(grouped[category], key=lambda x: (x["score"], x["published_at"]), reverse=True)
+        selected.extend(bucket[:MAX_PER_CATEGORY])
+
+    selected.sort(key=lambda x: (x["score"], x["published_at"]), reverse=True"])
+
+    # bỏ trùng theo tiêu đề gần giống rất cơ bản
+    final_items: List[Dict[str, Any]] = []
+    seen_title_keys = set()
+
+    for item in selected:
+        title_key = re.sub(r"[^a-z0-9]+", " ", item["title"].lower()).strip()
+        title_key = " ".join(title_key.split()[:8])
+        if title_key in seen_title_keys:
+            continue
+        seen_title_keys.add(title_key)
+        final_items.append(item)
+        if len(final_items) >= MAX_ITEMS:
+            break
+
+    return final_items
 
 
 # =========================
-# GEMINI HELPERS
+# GEMINI DIGEST
 # =========================
 def build_gemini_client():
     if not GEMINI_API_KEY:
@@ -348,132 +336,86 @@ def build_gemini_client():
     return genai.Client(api_key=GEMINI_API_KEY)
 
 
-def translate_title_vi(client, title: str) -> str:
-    original = clean_title(title)
+def build_digest_prompt(items: List[Dict[str, Any]]) -> str:
+    news_blocks = []
 
-    if not client:
-        return original
+    for i, item in enumerate(items, start=1):
+        news_blocks.append(
+            (
+                f"TIN {i}\n"
+                f"Nguồn: {item['source']}\n"
+                f"Chuyên mục gợi ý: {CATEGORY_LABEL_VI.get(item['category'], 'Tổng hợp')}\n"
+                f"Thời gian: {format_time_vn(item['published_at'])}\n"
+                f"Tiêu đề gốc: {item['title']}\n"
+                f"Tóm tắt gốc: {item['summary']}\n"
+                f"Link: {item['link']}"
+            )
+        )
 
-    prompt = f"""
-Dịch tiêu đề tin crypto sau sang tiếng Việt tự nhiên.
+    joined = "\n\n".join(news_blocks)
 
-Yêu cầu:
-- Dịch tối đa sang tiếng Việt.
-- Chỉ giữ lại tên riêng bắt buộc như Bitcoin, Ethereum, SEC, ETF, Solana.
-- Không thêm thông tin mới.
-- Chỉ trả về đúng 1 dòng tiêu đề tiếng Việt.
+    return f"""
+Bạn là biên tập viên bản tin crypto tiếng Việt cho Discord.
 
-Tiêu đề:
-{original}
+Hãy viết lại toàn bộ danh sách tin dưới đây thành MỘT bản tin hoàn chỉnh bằng tiếng Việt.
+
+YÊU CẦU BẮT BUỘC:
+- Toàn bộ nội dung phải là tiếng Việt.
+- Không giữ câu tiếng Anh, trừ tên riêng bắt buộc như Bitcoin, Ethereum, SEC, ETF, Tether, Solana.
+- Không dùng câu sáo rỗng như:
+  "Đây là diễn biến đáng chú ý..."
+  "Nhà đầu tư nên tiếp tục theo dõi..."
+  "Đây là thông tin quan trọng..."
+- Không bịa thêm dữ kiện ngoài dữ liệu gốc.
+- Văn phong ngắn gọn, tự nhiên, dễ đọc trên Discord.
+- Mỗi tin viết 1 đến 2 câu.
+- Nhóm theo các mục nếu phù hợp: 📈 Thị trường, ⚖️ Pháp lý, 🏦 DeFi, 🛡️ Bảo mật, 🧩 Hệ sinh thái, 📰 Tổng hợp.
+- Với mỗi tin, ghi theo đúng cấu trúc:
+
+• [Tiêu đề tiếng Việt]
+[Tóm tắt 1 đến 2 câu]
+Nguồn: [Tên nguồn] • [Thời gian]
+
+- Không dùng markdown link.
+- Không thêm lời mở đầu kiểu "Dưới đây là bản tin".
+- Không thêm kết luận tổng quát ở cuối.
+- Trả về đúng PHẦN NỘI DUNG bản tin, sẵn sàng để đưa vào embed Discord.
+
+DANH SÁCH TIN:
+{joined}
 """.strip()
 
-    try:
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                temperature=0.2,
-                max_output_tokens=80,
-            ),
-        )
-        result = clean_title((response.text or "").strip())
-        return result if result else original
-    except Exception:
-        return original
 
+def generate_digest_text(client, items: List[Dict[str, Any]]) -> str:
+    if not items:
+        return f"Không có tin mới nổi bật trong {LOOKBACK_HOURS} giờ gần đây."
 
-def translate_summary_vi(client, title: str, summary: str) -> str:
-    source_text = clean_summary(summary or title)
-
-    if not source_text:
-        return ""
-
-    if not client:
-        return source_text
-
-    prompt = f"""
-Dịch và viết lại đoạn tin crypto sau thành tiếng Việt tự nhiên.
-
-Yêu cầu:
-- Chỉ viết đúng 2 câu tiếng Việt.
-- Không giữ câu tiếng Anh.
-- Không văn mẫu, không thêm câu sáo rỗng.
-- Không thêm dữ kiện ngoài nội dung gốc.
-- Giọng văn ngắn gọn, kiểu bản tin.
-
-Tiêu đề:
-{title}
-
-Nội dung:
-{source_text}
-""".strip()
-
-    try:
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                temperature=0.3,
-                max_output_tokens=160,
-            ),
-        )
-        result = clean_summary((response.text or "").strip())
-        return result if result else source_text
-    except Exception:
-        return source_text
-
-
-def fallback_summary_vi(item: Dict[str, Any], client=None) -> Dict[str, str]:
-    title_vi = translate_title_vi(client, item["title"])
-    summary_vi = translate_summary_vi(client, item["title"], item["summary"])
-    tag_line = TAGLINE_MAP_VI.get(item["category"], "Tin đáng chú ý")
-
-    title_vi = clean_title(title_vi)
-    summary_vi = clean_summary(summary_vi)
-
-    if not title_vi:
-        title_vi = clean_title(item["title"])
-
-    if not summary_vi:
-        summary_vi = clean_summary(truncate_text(item["summary"] or item["title"], 220))
-
-    return {
-        "title_vi": title_vi,
-        "summary_vi": summary_vi,
-        "tag_line": tag_line,
-    }
-
-
-def summarize_with_gemini(client, item: Dict[str, Any]) -> Dict[str, str]:
     if client is None:
-        return fallback_summary_vi(item, client=None)
+        # fallback không dùng Gemini: tạo bản tin tiếng Việt tối giản từ dữ liệu thô
+        lines: List[str] = []
+        current_cat = None
+        ordered_categories = ["Market", "Regulation", "DeFi", "Security", "Alt & Ecosystem", "General"]
 
-    text_block = (
-        f"TITLE: {item['title']}\n"
-        f"CATEGORY: {item['category']}\n"
-        f"SOURCE: {item['source']}\n"
-        f"PUBLISHED: {item['published_at'].isoformat()}\n"
-        f"LINK: {item['link']}\n"
-        f"ARTICLE_SNIPPET: {item['summary'][:1800]}"
-    )
+        for category in ordered_categories:
+            bucket = [x for x in items if x["category"] == category]
+            if not bucket:
+                continue
 
-    prompt = f"""
-Bạn là biên tập viên bản tin crypto tiếng Việt.
+            cat_label = CATEGORY_LABEL_VI.get(category, "Tổng hợp")
+            emoji = CATEGORY_EMOJI.get(category, "📰")
+            lines.append(f"{emoji} {cat_label}")
 
-Hãy đọc dữ liệu bài báo và trả về JSON đúng schema với 3 trường:
-- title_vi
-- summary_vi
-- tag_line
+            for item in bucket:
+                title = truncate_text(item["title"], 110)
+                summary = truncate_text(item["summary"], 200)
+                lines.append(f"• {title}")
+                lines.append(summary)
+                lines.append(f"Nguồn: {item['source']} • {format_time_vn(item['published_at'])}")
+                lines.append("")
 
-Yêu cầu:
-- title_vi phải là tiếng Việt, không để tiếng Anh trừ tên riêng bắt buộc.
-- summary_vi phải là đúng 2 câu tiếng Việt, ngắn gọn, giàu thông tin.
-- Không dùng câu sáo rỗng như "đây là diễn biến đáng chú ý".
-- Không thêm dữ kiện ngoài dữ liệu gốc.
+        return cleanup_digest_text("\n".join(lines).strip())
 
-Dữ liệu:
-{text_block}
-""".strip()
+    prompt = build_digest_prompt(items)
 
     try:
         response = client.models.generate_content(
@@ -481,145 +423,72 @@ Dữ liệu:
             contents=prompt,
             config=types.GenerateContentConfig(
                 temperature=0.3,
-                response_mime_type="application/json",
-                response_schema=NewsSummary,
-                max_output_tokens=400,
+                max_output_tokens=1800,
             ),
         )
+        text = cleanup_digest_text((response.text or "").strip())
 
-        data = response.parsed
-        if not data:
-            return fallback_summary_vi(item, client)
+        if not text:
+            raise ValueError("Gemini returned empty digest")
 
-        title_vi = clean_title((data.title_vi or "").strip())
-        summary_vi = clean_summary((data.summary_vi or "").strip())
-        tag_line = truncate_text((data.tag_line or "").strip(), 30)
-
-        if not title_vi or is_mostly_english(title_vi):
-            title_vi = translate_title_vi(client, item["title"])
-
-        if not summary_vi or is_mostly_english(summary_vi):
-            summary_vi = translate_summary_vi(client, item["title"], item["summary"])
-
-        if not tag_line:
-            tag_line = TAGLINE_MAP_VI.get(item["category"], "Tin đáng chú ý")
-
-        return {
-            "title_vi": clean_title(title_vi),
-            "summary_vi": clean_summary(summary_vi),
-            "tag_line": tag_line,
-        }
-
+        return text
     except Exception as e:
-        print(f"[WARN] Gemini failed for {item['title'][:80]}: {e}")
-        return fallback_summary_vi(item, client)
-
-
-def enrich_articles_with_ai(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    client = build_gemini_client()
-    enriched: List[Dict[str, Any]] = []
-
-    for item in items:
-        ai_result = summarize_with_gemini(client, item)
-        item["title_vi"] = ai_result["title_vi"]
-        item["summary_vi"] = ai_result["summary_vi"]
-        item["tag_line"] = ai_result["tag_line"]
-        enriched.append(item)
-
-    return enriched
-
-
-# =========================
-# GROUPING
-# =========================
-def group_items(items: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
-    grouped: Dict[str, List[Dict[str, Any]]] = {}
-
-    for item in items:
-        grouped.setdefault(item["category"], []).append(item)
-
-    for category in grouped:
-        grouped[category].sort(key=lambda x: (x["score"], x["published_at"]), reverse=True)
-        grouped[category] = grouped[category][:MAX_PER_CATEGORY]
-
-    return grouped
-
-
-def chunk_list(arr: List[Any], n: int):
-    for i in range(0, len(arr), n):
-        yield arr[i:i + n]
+        print(f"[WARN] Gemini digest generation failed: {e}")
+        return generate_digest_text(None, items)
 
 
 # =========================
 # DISCORD FORMAT
 # =========================
-def build_embed_fields(grouped: Dict[str, List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
-    ordered_categories = ["Market", "Regulation", "DeFi", "Security", "Alt & Ecosystem", "General"]
-    fields: List[Dict[str, Any]] = []
+def split_text_for_embeds(text: str, max_len: int = 3800) -> List[str]:
+    text = text.strip()
+    if len(text) <= max_len:
+        return [text]
 
-    for category in ordered_categories:
-        if category not in grouped:
+    parts: List[str] = []
+    current = ""
+
+    for block in text.split("\n\n"):
+        block = block.strip()
+        if not block:
             continue
 
-        emoji = CATEGORY_EMOJI.get(category, "📰")
-        category_label = CATEGORY_LABEL_VI.get(category, category)
-        blocks: List[str] = []
+        candidate = block if not current else f"{current}\n\n{block}"
+        if len(candidate) <= max_len:
+            current = candidate
+        else:
+            if current:
+                parts.append(current)
+            if len(block) <= max_len:
+                current = block
+            else:
+                # block quá dài thì cắt cứng
+                for i in range(0, len(block), max_len):
+                    chunk = block[i:i + max_len].strip()
+                    if chunk:
+                        parts.append(chunk)
+                current = ""
 
-        for item in grouped[category]:
-            title_vi = truncate_text(clean_title(item.get("title_vi") or item["title"]), 100)
-            summary_vi = truncate_text(clean_summary(item.get("summary_vi") or item["summary"]), 320)
-            tag_line = truncate_text(item.get("tag_line", TAGLINE_MAP_VI.get(category, "Tin đáng chú ý")), 30)
+    if current:
+        parts.append(current)
 
-            block = (
-                f"**[{title_vi}]({item['link']})**\n"
-                f"*{tag_line}*\n"
-                f"{summary_vi}\n"
-                f"`{item['source']}` • {format_time_vn(item['published_at'])}"
-            )
-            blocks.append(block)
-
-        field_value = "\n\n".join(blocks)
-        field_value = truncate_text(field_value, 1024)
-
-        fields.append({
-            "name": f"{emoji} {category_label}",
-            "value": field_value,
-            "inline": False
-        })
-
-    return fields
+    return parts[:5]
 
 
-def build_discord_payload(items: List[Dict[str, Any]]) -> Dict[str, Any]:
-    now_vn = datetime.now(timezone(timedelta(hours=7))).strftime("%d/%m/%Y %H:%M ICT")
+def build_discord_payload_from_digest(digest_text: str, items_count: int) -> Dict[str, Any]:
+    current_time = now_vn_str()
+    digest_text = cleanup_digest_text(digest_text)
 
-    if not items:
-        return {
-            "content": "📰 **Bản tin crypto 2 kỳ mỗi ngày**",
-            "embeds": [
-                {
-                    "title": f"Crypto Daily Brief | {now_vn}",
-                    "description": f"Không có tin mới nổi bật trong {LOOKBACK_HOURS} giờ gần đây.",
-                    "color": EMBED_COLOR,
-                }
-            ]
-        }
-
-    grouped = group_items(items)
-    fields = build_embed_fields(grouped)
+    chunks = split_text_for_embeds(digest_text, max_len=3800)
     embeds = []
 
-    for idx, field_group in enumerate(chunk_list(fields, 3), start=1):
+    for idx, chunk in enumerate(chunks, start=1):
         embed = {
-            "title": f"Crypto Daily Brief | {now_vn}" if idx == 1 else f"Crypto Daily Brief | phần {idx}",
-            "description": (
-                f"Tổng hợp tin crypto trong {LOOKBACK_HOURS} giờ gần nhất.\n"
-                f"Tóm tắt hoàn toàn bằng tiếng Việt, ngắn gọn và dễ đọc."
-            ) if idx == 1 else "Tiếp tục bản tin.",
+            "title": f"Crypto Daily Brief | {current_time}" if idx == 1 else f"Crypto Daily Brief | phần {idx}",
+            "description": chunk,
             "color": EMBED_COLOR,
-            "fields": field_group,
             "footer": {
-                "text": f"{len(items)} tin • RSS + Gemini • Auto digest"
+                "text": f"{items_count} tin • RSS + Gemini • Auto digest"
             },
             "timestamp": datetime.now(timezone.utc).isoformat()
         }
@@ -631,9 +500,6 @@ def build_discord_payload(items: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
-# =========================
-# DISCORD SEND
-# =========================
 def send_to_discord(payload: Dict[str, Any]) -> None:
     if not DISCORD_WEBHOOK_URL:
         raise ValueError("Missing DISCORD_WEBHOOK_URL")
@@ -650,33 +516,33 @@ def main() -> None:
     state = load_state()
     posted_ids = set(state.get("posted_ids", []))
 
-    items = fetch_articles()
+    all_items = fetch_articles()
 
     if TEST_MODE:
-        new_items = items[:MAX_ITEMS]
+        candidate_items = limit_items_balanced(all_items)
     else:
-        new_items = [item for item in items if item["id"] not in posted_ids]
+        unseen_items = [item for item in all_items if item["id"] not in posted_ids]
+        candidate_items = limit_items_balanced(unseen_items)
 
-    if not new_items:
-        payload = build_discord_payload([])
+    if not candidate_items:
+        digest_text = f"Không có tin mới nổi bật trong {LOOKBACK_HOURS} giờ gần đây."
+        payload = build_discord_payload_from_digest(digest_text, 0)
         send_to_discord(payload)
         print("No new items, sent empty digest.")
         return
 
-    selected_items = new_items[:MAX_ITEMS]
-    enriched_items = enrich_articles_with_ai(selected_items)
-
-    payload = build_discord_payload(enriched_items)
+    client = build_gemini_client()
+    digest_text = generate_digest_text(client, candidate_items)
+    payload = build_discord_payload_from_digest(digest_text, len(candidate_items))
     send_to_discord(payload)
 
     if not TEST_MODE:
-        for item in selected_items:
+        for item in candidate_items:
             posted_ids.add(item["id"])
-
         state["posted_ids"] = list(posted_ids)[-1500:]
         save_state(state)
 
-    print(f"Posted {len(enriched_items)} new items.")
+    print(f"Posted digest with {len(candidate_items)} items.")
 
 
 if __name__ == "__main__":
