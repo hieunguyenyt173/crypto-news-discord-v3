@@ -308,7 +308,7 @@ def limit_items_balanced(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         bucket = sorted(grouped[category], key=lambda x: (x["score"], x["published_at"]), reverse=True)
         selected.extend(bucket[:MAX_PER_CATEGORY])
 
-    selected.sort(key=lambda x: (x["score"], x["published_at"]), reverse=True"])
+    selected.sort(key=lambda x: (x["score"], x["published_at"]), reverse=True)
 
     # bỏ trùng theo tiêu đề gần giống rất cơ bản
     final_items: List[Dict[str, Any]] = []
