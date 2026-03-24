@@ -28,9 +28,11 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
 LOOKBACK_HOURS = int(os.getenv("LOOKBACK_HOURS", "12"))
 MAX_ITEMS = int(os.getenv("MAX_ITEMS", "8"))
-MAX_PER_CATEGORY = int(os.getenv("MAX_PER_CATEGORY", "3"))
+MAX_PER_CATEGORY = int(os.getenv("MAX_PER_CATEGORY", "2"))
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
 TEST_MODE = os.getenv("TEST_MODE", "false").lower() == "true"
+STRICT_VIETNAMESE = os.getenv("STRICT_VIETNAMESE", "true").lower() == "true"
+DEBUG_LOG = os.getenv("DEBUG_LOG", "true").lower() == "true"
 
 STATE_FILE = "posted_state.json"
 SOURCES_FILE = "sources.json"
@@ -86,6 +88,14 @@ CATEGORY_EMOJI = {
     "Alt & Ecosystem": "🧩",
     "General": "📰"
 }
+
+
+# =========================
+# LOGGING
+# =========================
+def log(message: str) -> None:
+    if DEBUG_LOG:
+        print(message)
 
 
 # =========================
@@ -147,7 +157,9 @@ def cleanup_digest_text(text: str) -> str:
         r"Nhà đầu tư nên tiếp tục theo dõi[^.\n]*\.?",
         r"Đây là thông tin quan trọng[^.\n]*\.?",
         r"Tin đáng chú ý[^.\n]*\.?",
+        r"Dưới đây là bản tin[^.\n]*\.?",
     ]
+
     for pattern in banned_patterns:
         text = re.sub(pattern, "", text, flags=re.IGNORECASE)
 
@@ -162,6 +174,29 @@ def format_time_vn(dt_utc: datetime) -> str:
 
 def now_vn_str() -> str:
     return datetime.now(timezone(timedelta(hours=7))).strftime("%d/%m/%Y %H:%M ICT")
+
+
+def is_digest_mostly_vietnamese(text: str) -> bool:
+    if not text:
+        return False
+
+    text = text.strip()
+
+    ascii_words = re.findall(r"\b[a-zA-Z]{3,}\b", text)
+    vietnamese_chars = re.findall(
+        r"[ăâđêôơưáàảãạấầẩẫậắằẳẵặéèẻẽẹếềểễệíìỉĩịóòỏõọốồổỗộớờởỡợúùủũụứừửữựýỳỷỹỵ]",
+        text.lower()
+    )
+
+    bullet_count = text.count("•")
+    source_count = text.count("Nguồn:")
+
+    log(f"[CHECK] ascii_words={len(ascii_words)} | vietnamese_chars={len(vietnamese_chars)} | bullets={bullet_count} | sources={source_count}")
+
+    if len(vietnamese_chars) >= 20 and bullet_count >= 1 and source_count >= 1:
+        return True
+
+    return len(ascii_words) < 25
 
 
 # =========================
@@ -244,6 +279,8 @@ def fetch_articles() -> List[Dict[str, Any]]:
     sources = load_sources()
     all_items: List[Dict[str, Any]] = []
 
+    log(f"[INFO] Fetching RSS from {len(sources)} sources | cutoff={cutoff.isoformat()}")
+
     for source in sources:
         source_name = source["name"]
         feed_url = source["rss"]
@@ -251,8 +288,10 @@ def fetch_articles() -> List[Dict[str, Any]]:
         try:
             feed = feedparser.parse(feed_url)
         except Exception as e:
-            print(f"[WARN] Failed to parse {source_name}: {e}")
+            log(f"[WARN] Failed to parse {source_name}: {e}")
             continue
+
+        entry_count = 0
 
         for entry in feed.entries:
             title = strip_html(getattr(entry, "title", "").strip())
@@ -281,6 +320,9 @@ def fetch_articles() -> List[Dict[str, Any]]:
                 "score": score,
             }
             all_items.append(item)
+            entry_count += 1
+
+        log(f"[INFO] {source_name}: kept {entry_count} items")
 
     dedup_by_link: Dict[str, Dict[str, Any]] = {}
     for item in all_items:
@@ -290,6 +332,8 @@ def fetch_articles() -> List[Dict[str, Any]]:
 
     items = list(dedup_by_link.values())
     items.sort(key=lambda x: (x["score"], x["published_at"]), reverse=True)
+
+    log(f"[INFO] Total fetched after dedup: {len(items)}")
     return items
 
 
@@ -305,25 +349,36 @@ def limit_items_balanced(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     for category in ordered_categories:
         if category not in grouped:
             continue
-        bucket = sorted(grouped[category], key=lambda x: (x["score"], x["published_at"]), reverse=True)
+
+        bucket = sorted(
+            grouped[category],
+            key=lambda x: (x["score"], x["published_at"]),
+            reverse=True
+        )
         selected.extend(bucket[:MAX_PER_CATEGORY])
 
-    selected.sort(key=lambda x: (x["score"], x["published_at"]), reverse=True)
+    selected.sort(
+        key=lambda x: (x["score"], x["published_at"]),
+        reverse=True
+    )
 
-    # bỏ trùng theo tiêu đề gần giống rất cơ bản
     final_items: List[Dict[str, Any]] = []
     seen_title_keys = set()
 
     for item in selected:
         title_key = re.sub(r"[^a-z0-9]+", " ", item["title"].lower()).strip()
         title_key = " ".join(title_key.split()[:8])
+
         if title_key in seen_title_keys:
             continue
+
         seen_title_keys.add(title_key)
         final_items.append(item)
+
         if len(final_items) >= MAX_ITEMS:
             break
 
+    log(f"[INFO] Selected balanced items: {len(final_items)}")
     return final_items
 
 
@@ -332,7 +387,8 @@ def limit_items_balanced(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 # =========================
 def build_gemini_client():
     if not GEMINI_API_KEY:
-        return None
+        raise RuntimeError("Missing GEMINI_API_KEY")
+
     return genai.Client(api_key=GEMINI_API_KEY)
 
 
@@ -361,7 +417,7 @@ Hãy viết lại toàn bộ danh sách tin dưới đây thành MỘT bản tin
 
 YÊU CẦU BẮT BUỘC:
 - Toàn bộ nội dung phải là tiếng Việt.
-- Không giữ câu tiếng Anh, trừ tên riêng bắt buộc như Bitcoin, Ethereum, SEC, ETF, Tether, Solana.
+- Không giữ câu tiếng Anh, trừ tên riêng bắt buộc như Bitcoin, Ethereum, SEC, ETF, Tether, Solana, Coinbase.
 - Không dùng câu sáo rỗng như:
   "Đây là diễn biến đáng chú ý..."
   "Nhà đầu tư nên tiếp tục theo dõi..."
@@ -369,8 +425,14 @@ YÊU CẦU BẮT BUỘC:
 - Không bịa thêm dữ kiện ngoài dữ liệu gốc.
 - Văn phong ngắn gọn, tự nhiên, dễ đọc trên Discord.
 - Mỗi tin viết 1 đến 2 câu.
-- Nhóm theo các mục nếu phù hợp: 📈 Thị trường, ⚖️ Pháp lý, 🏦 DeFi, 🛡️ Bảo mật, 🧩 Hệ sinh thái, 📰 Tổng hợp.
-- Với mỗi tin, ghi theo đúng cấu trúc:
+- Nhóm theo các mục nếu phù hợp:
+  📈 Thị trường
+  ⚖️ Pháp lý
+  🏦 DeFi
+  🛡️ Bảo mật
+  🧩 Hệ sinh thái
+  📰 Tổng hợp
+- Với mỗi tin, ghi theo đúng cấu trúc sau:
 
 • [Tiêu đề tiếng Việt]
 [Tóm tắt 1 đến 2 câu]
@@ -390,51 +452,33 @@ def generate_digest_text(client, items: List[Dict[str, Any]]) -> str:
     if not items:
         return f"Không có tin mới nổi bật trong {LOOKBACK_HOURS} giờ gần đây."
 
-    if client is None:
-        # fallback không dùng Gemini: tạo bản tin tiếng Việt tối giản từ dữ liệu thô
-        lines: List[str] = []
-        current_cat = None
-        ordered_categories = ["Market", "Regulation", "DeFi", "Security", "Alt & Ecosystem", "General"]
-
-        for category in ordered_categories:
-            bucket = [x for x in items if x["category"] == category]
-            if not bucket:
-                continue
-
-            cat_label = CATEGORY_LABEL_VI.get(category, "Tổng hợp")
-            emoji = CATEGORY_EMOJI.get(category, "📰")
-            lines.append(f"{emoji} {cat_label}")
-
-            for item in bucket:
-                title = truncate_text(item["title"], 110)
-                summary = truncate_text(item["summary"], 200)
-                lines.append(f"• {title}")
-                lines.append(summary)
-                lines.append(f"Nguồn: {item['source']} • {format_time_vn(item['published_at'])}")
-                lines.append("")
-
-        return cleanup_digest_text("\n".join(lines).strip())
-
     prompt = build_digest_prompt(items)
+    log(f"[INFO] Sending {len(items)} items to Gemini with model={GEMINI_MODEL}")
 
     try:
         response = client.models.generate_content(
             model=GEMINI_MODEL,
             contents=prompt,
             config=types.GenerateContentConfig(
-                temperature=0.3,
+                temperature=0.2,
                 max_output_tokens=1800,
             ),
         )
-        text = cleanup_digest_text((response.text or "").strip())
-
-        if not text:
-            raise ValueError("Gemini returned empty digest")
-
-        return text
     except Exception as e:
-        print(f"[WARN] Gemini digest generation failed: {e}")
-        return generate_digest_text(None, items)
+        raise RuntimeError(f"Gemini API call failed: {e}")
+
+    text = cleanup_digest_text((response.text or "").strip())
+
+    log("[DEBUG] Gemini raw output preview:")
+    log(text[:1200] if text else "[EMPTY]")
+
+    if not text:
+        raise RuntimeError("Gemini returned empty digest")
+
+    if STRICT_VIETNAMESE and not is_digest_mostly_vietnamese(text):
+        raise RuntimeError("Digest is still mostly English")
+
+    return text
 
 
 # =========================
@@ -459,10 +503,10 @@ def split_text_for_embeds(text: str, max_len: int = 3800) -> List[str]:
         else:
             if current:
                 parts.append(current)
+
             if len(block) <= max_len:
                 current = block
             else:
-                # block quá dài thì cắt cứng
                 for i in range(0, len(block), max_len):
                     chunk = block[i:i + max_len].strip()
                     if chunk:
@@ -502,7 +546,7 @@ def build_discord_payload_from_digest(digest_text: str, items_count: int) -> Dic
 
 def send_to_discord(payload: Dict[str, Any]) -> None:
     if not DISCORD_WEBHOOK_URL:
-        raise ValueError("Missing DISCORD_WEBHOOK_URL")
+        raise RuntimeError("Missing DISCORD_WEBHOOK_URL")
 
     response = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=30)
     if response.status_code not in (200, 204):
@@ -513,8 +557,25 @@ def send_to_discord(payload: Dict[str, Any]) -> None:
 # MAIN
 # =========================
 def main() -> None:
+    log("========== BOT START ==========")
+    log(f"[ENV] Has webhook: {bool(DISCORD_WEBHOOK_URL)}")
+    log(f"[ENV] Has gemini key: {bool(GEMINI_API_KEY)}")
+    log(f"[ENV] Model: {GEMINI_MODEL}")
+    log(f"[ENV] Test mode: {TEST_MODE}")
+    log(f"[ENV] Strict Vietnamese: {STRICT_VIETNAMESE}")
+    log(f"[ENV] Lookback hours: {LOOKBACK_HOURS}")
+    log(f"[ENV] Max items: {MAX_ITEMS}")
+    log(f"[ENV] Max per category: {MAX_PER_CATEGORY}")
+
+    if not DISCORD_WEBHOOK_URL:
+        raise RuntimeError("DISCORD_WEBHOOK_URL is missing")
+
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY is missing")
+
     state = load_state()
     posted_ids = set(state.get("posted_ids", []))
+    log(f"[INFO] Existing posted_ids: {len(posted_ids)}")
 
     all_items = fetch_articles()
 
@@ -522,27 +583,38 @@ def main() -> None:
         candidate_items = limit_items_balanced(all_items)
     else:
         unseen_items = [item for item in all_items if item["id"] not in posted_ids]
+        log(f"[INFO] Unseen items: {len(unseen_items)}")
         candidate_items = limit_items_balanced(unseen_items)
 
     if not candidate_items:
+        log("[INFO] No candidate items")
         digest_text = f"Không có tin mới nổi bật trong {LOOKBACK_HOURS} giờ gần đây."
         payload = build_discord_payload_from_digest(digest_text, 0)
         send_to_discord(payload)
-        print("No new items, sent empty digest.")
+        log("[INFO] Sent empty digest")
         return
+
+    for idx, item in enumerate(candidate_items, start=1):
+        log(f"[ITEM {idx}] {item['source']} | {item['category']} | {item['title'][:120]}")
 
     client = build_gemini_client()
     digest_text = generate_digest_text(client, candidate_items)
+
     payload = build_discord_payload_from_digest(digest_text, len(candidate_items))
     send_to_discord(payload)
+    log("[INFO] Discord message sent successfully")
 
     if not TEST_MODE:
         for item in candidate_items:
             posted_ids.add(item["id"])
+
         state["posted_ids"] = list(posted_ids)[-1500:]
         save_state(state)
+        log(f"[INFO] State saved with {len(state['posted_ids'])} ids")
+    else:
+        log("[INFO] TEST_MODE enabled, state not updated")
 
-    print(f"Posted digest with {len(candidate_items)} items.")
+    log("========== BOT END ==========")
 
 
 if __name__ == "__main__":
