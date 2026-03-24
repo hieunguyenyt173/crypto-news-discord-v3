@@ -171,15 +171,27 @@ def clean_summary(text: str) -> str:
         text = re.sub(pattern, "", text, flags=re.IGNORECASE)
 
     text = re.sub(r"\s+", " ", text).strip()
-
     return text
 
 
 def clean_title(text: str) -> str:
     if not text:
         return ""
-    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"\s+", " ", text).strip(" -–—:|")
     return truncate_text(text, 110)
+
+
+def is_mostly_english(text: str) -> bool:
+    if not text:
+        return False
+
+    letters = re.findall(r"[A-Za-z]", text)
+    if len(letters) < 8:
+        return False
+
+    vietnamese_chars = re.findall(r"[ăâđêôơưáàảãạấầẩẫậắằẳẵặéèẻẽẹếềểễệíìỉĩịóòỏõọốồổỗộớờởỡợúùủũụứừửữựýỳỷỹỵ]", text.lower())
+
+    return len(vietnamese_chars) == 0
 
 
 def format_time_vn(dt_utc: datetime) -> str:
@@ -330,11 +342,55 @@ def fallback_summary_vi(item: Dict[str, Any]) -> Dict[str, str]:
     summary_vi = clean_summary(truncate_text(item["summary"] or item["title"], 220))
     tag_line = TAGLINE_MAP_VI.get(item["category"], "Tin đáng chú ý")
 
+    if is_mostly_english(title_vi):
+        title_vi = f"Tin mới: {clean_title(item['title'])}"
+
     return {
         "title_vi": title_vi,
         "summary_vi": summary_vi,
         "tag_line": tag_line,
     }
+
+
+def translate_title_vi(client, title: str) -> str:
+    clean_original = clean_title(title)
+    if not client:
+        return f"Tin mới: {clean_original}"
+
+    prompt = f"""
+Dịch tiêu đề tin tức crypto sau sang tiếng Việt tự nhiên.
+
+Yêu cầu:
+- Dịch sang tiếng Việt tối đa có thể.
+- Không giữ tiếng Anh.
+- Chỉ giữ lại tên riêng hoặc thuật ngữ bắt buộc như Bitcoin, Ethereum, SEC, ETF, Solana.
+- Không thêm thông tin mới.
+- Chỉ trả về đúng một dòng tiêu đề.
+
+Tiêu đề:
+{clean_original}
+""".strip()
+
+    try:
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                temperature=0.2,
+                max_output_tokens=80,
+            ),
+        )
+
+        translated = clean_title((response.text or "").strip())
+        if not translated:
+            return f"Tin mới: {clean_original}"
+
+        if is_mostly_english(translated):
+            return f"Tin mới: {clean_original}"
+
+        return translated
+    except Exception:
+        return f"Tin mới: {clean_original}"
 
 
 def summarize_with_gemini(client, item: Dict[str, Any]) -> Dict[str, str]:
@@ -370,7 +426,8 @@ YÊU CẦU BẮT BUỘC:
 Trả về JSON gồm đúng 3 trường:
 
 1. title_vi
-- Viết lại tiêu đề hoàn toàn bằng tiếng Việt.
+- DỊCH tiêu đề sang tiếng Việt.
+- Không được giữ tiếng Anh, trừ tên riêng bắt buộc.
 - Ngắn gọn, dễ hiểu, tối đa 110 ký tự.
 
 2. summary_vi
@@ -407,7 +464,13 @@ Dữ liệu bài báo:
         summary_vi = clean_summary(data.summary_vi)
         tag_line = truncate_text((data.tag_line or "").strip(), 30)
 
-        if not title_vi or not summary_vi:
+        if not title_vi:
+            title_vi = translate_title_vi(client, item["title"])
+
+        if is_mostly_english(title_vi):
+            title_vi = translate_title_vi(client, item["title"])
+
+        if not summary_vi:
             return fallback_summary_vi(item)
 
         if not tag_line:
