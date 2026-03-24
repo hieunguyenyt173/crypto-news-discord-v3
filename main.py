@@ -27,7 +27,7 @@ DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
 LOOKBACK_HOURS = int(os.getenv("LOOKBACK_HOURS", "12"))
-MAX_ITEMS = int(os.getenv("MAX_ITEMS", "8"))
+MAX_ITEMS = int(os.getenv("MAX_ITEMS", "6"))
 MAX_PER_CATEGORY = int(os.getenv("MAX_PER_CATEGORY", "2"))
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
 TEST_MODE = os.getenv("TEST_MODE", "false").lower() == "true"
@@ -174,6 +174,12 @@ def format_time_vn(dt_utc: datetime) -> str:
 
 def now_vn_str() -> str:
     return datetime.now(timezone(timedelta(hours=7))).strftime("%d/%m/%Y %H:%M ICT")
+
+
+def count_bullets(text: str) -> int:
+    if not text:
+        return 0
+    return len(re.findall(r"^\s*•", text, flags=re.MULTILINE))
 
 
 def is_digest_mostly_vietnamese(text: str) -> bool:
@@ -388,7 +394,6 @@ def limit_items_balanced(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 def build_gemini_client():
     if not GEMINI_API_KEY:
         raise RuntimeError("Missing GEMINI_API_KEY")
-
     return genai.Client(api_key=GEMINI_API_KEY)
 
 
@@ -409,6 +414,7 @@ def build_digest_prompt(items: List[Dict[str, Any]]) -> str:
         )
 
     joined = "\n\n".join(news_blocks)
+    total_items = len(items)
 
     return f"""
 Bạn là biên tập viên bản tin crypto tiếng Việt cho Discord.
@@ -416,6 +422,11 @@ Bạn là biên tập viên bản tin crypto tiếng Việt cho Discord.
 Hãy viết lại toàn bộ danh sách tin dưới đây thành MỘT bản tin hoàn chỉnh bằng tiếng Việt.
 
 YÊU CẦU BẮT BUỘC:
+- Phải dùng đủ cả {total_items} tin.
+- Không được bỏ sót tin nào.
+- Mỗi tin tương ứng đúng 1 bullet bắt đầu bằng ký tự "•".
+- Tổng số bullet trong kết quả phải đúng bằng {total_items}.
+- Không gộp hai tin thành một.
 - Toàn bộ nội dung phải là tiếng Việt.
 - Không giữ câu tiếng Anh, trừ tên riêng bắt buộc như Bitcoin, Ethereum, SEC, ETF, Tether, Solana, Coinbase.
 - Không dùng câu sáo rỗng như:
@@ -432,16 +443,16 @@ YÊU CẦU BẮT BUỘC:
   🛡️ Bảo mật
   🧩 Hệ sinh thái
   📰 Tổng hợp
-- Với mỗi tin, ghi theo đúng cấu trúc sau:
 
+Với mỗi tin, ghi đúng cấu trúc:
 • [Tiêu đề tiếng Việt]
 [Tóm tắt 1 đến 2 câu]
 Nguồn: [Tên nguồn] • [Thời gian]
 
 - Không dùng markdown link.
-- Không thêm lời mở đầu kiểu "Dưới đây là bản tin".
-- Không thêm kết luận tổng quát ở cuối.
-- Trả về đúng PHẦN NỘI DUNG bản tin, sẵn sàng để đưa vào embed Discord.
+- Không thêm lời mở đầu.
+- Không thêm kết luận.
+- Chỉ trả về phần nội dung bản tin.
 
 DANH SÁCH TIN:
 {joined}
@@ -453,32 +464,63 @@ def generate_digest_text(client, items: List[Dict[str, Any]]) -> str:
         return f"Không có tin mới nổi bật trong {LOOKBACK_HOURS} giờ gần đây."
 
     prompt = build_digest_prompt(items)
-    log(f"[INFO] Sending {len(items)} items to Gemini with model={GEMINI_MODEL}")
+    expected_bullets = len(items)
 
-    try:
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                temperature=0.2,
-                max_output_tokens=1800,
-            ),
-        )
-    except Exception as e:
-        raise RuntimeError(f"Gemini API call failed: {e}")
+    log(f"[INFO] Sending {expected_bullets} items to Gemini with model={GEMINI_MODEL}")
 
-    text = cleanup_digest_text((response.text or "").strip())
+    last_error = None
 
-    log("[DEBUG] Gemini raw output preview:")
-    log(text[:1200] if text else "[EMPTY]")
+    for attempt in range(1, 4):
+        log(f"[INFO] Gemini attempt {attempt}")
 
-    if not text:
-        raise RuntimeError("Gemini returned empty digest")
+        try:
+            response = client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    temperature=0.2,
+                    max_output_tokens=2200,
+                ),
+            )
+        except Exception as e:
+            last_error = f"Gemini API call failed: {e}"
+            log(f"[WARN] {last_error}")
+            continue
 
-    if STRICT_VIETNAMESE and not is_digest_mostly_vietnamese(text):
-        raise RuntimeError("Digest is still mostly English")
+        text = cleanup_digest_text((response.text or "").strip())
 
-    return text
+        log("[DEBUG] Gemini raw output preview:")
+        log(text[:1500] if text else "[EMPTY]")
+
+        if not text:
+            last_error = "Gemini returned empty digest"
+            log(f"[WARN] {last_error}")
+            continue
+
+        bullet_count = count_bullets(text)
+        log(f"[CHECK] bullet_count={bullet_count} | expected={expected_bullets}")
+
+        if STRICT_VIETNAMESE and not is_digest_mostly_vietnamese(text):
+            last_error = "Digest is still mostly English"
+            log(f"[WARN] {last_error}")
+            continue
+
+        if bullet_count < expected_bullets:
+            last_error = f"Digest returned too few items: got {bullet_count}, expected {expected_bullets}"
+            log(f"[WARN] {last_error}")
+
+            prompt = prompt + f"""
+
+NHẮC LẠI:
+- Kết quả trước đó bị thiếu tin.
+- Bạn PHẢI viết đủ đúng {expected_bullets} bullet bắt đầu bằng "•".
+- Không được bỏ sót bất kỳ TIN nào từ TIN 1 đến TIN {expected_bullets}.
+"""
+            continue
+
+        return text
+
+    raise RuntimeError(last_error or "Gemini digest generation failed")
 
 
 # =========================
