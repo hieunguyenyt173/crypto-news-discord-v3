@@ -4,15 +4,16 @@ import json
 import time
 import html
 import hashlib
-import requests
-import feedparser
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timezone, timedelta
 from email.utils import parsedate_to_datetime
 
+import feedparser
+import requests
 from pydantic import BaseModel
 from google import genai
 from google.genai import types
+
 
 # =========================
 # ENV CONFIG
@@ -20,8 +21,8 @@ from google.genai import types
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
-LOOKBACK_HOURS = int(os.getenv("LOOKBACK_HOURS", "24"))
-MAX_ITEMS = int(os.getenv("MAX_ITEMS", "12"))
+LOOKBACK_HOURS = int(os.getenv("LOOKBACK_HOURS", "12"))
+MAX_ITEMS = int(os.getenv("MAX_ITEMS", "10"))
 MAX_PER_CATEGORY = int(os.getenv("MAX_PER_CATEGORY", "3"))
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
 
@@ -30,6 +31,10 @@ SOURCES_FILE = "sources.json"
 
 EMBED_COLOR = 3447003
 
+
+# =========================
+# CATEGORY CONFIG
+# =========================
 CATEGORY_RULES = {
     "Market": [
         "bitcoin", "btc", "ethereum", "eth", "solana", "sol",
@@ -58,6 +63,15 @@ CATEGORY_RULES = {
     ]
 }
 
+CATEGORY_LABEL_VI = {
+    "Market": "Thị trường",
+    "Regulation": "Pháp lý",
+    "DeFi": "DeFi",
+    "Security": "Bảo mật",
+    "Alt & Ecosystem": "Hệ sinh thái",
+    "General": "Tổng hợp"
+}
+
 CATEGORY_EMOJI = {
     "Market": "📈",
     "Regulation": "⚖️",
@@ -67,19 +81,27 @@ CATEGORY_EMOJI = {
     "General": "📰"
 }
 
+TAGLINE_MAP_VI = {
+    "Market": "Biến động thị trường",
+    "Regulation": "Tin pháp lý",
+    "DeFi": "Cập nhật DeFi",
+    "Security": "Cảnh báo bảo mật",
+    "Alt & Ecosystem": "Cập nhật hệ sinh thái",
+    "General": "Tin đáng chú ý"
+}
+
 
 # =========================
-# Pydantic schema
+# SCHEMA
 # =========================
 class NewsSummary(BaseModel):
     title_vi: str
     summary_vi: str
-    impact_vi: str
     tag_line: str
 
 
 # =========================
-# Basic helpers
+# FILE / STATE HELPERS
 # =========================
 def load_sources() -> List[Dict[str, str]]:
     with open(SOURCES_FILE, "r", encoding="utf-8") as f:
@@ -98,6 +120,9 @@ def save_state(state: Dict[str, Any]) -> None:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
 
+# =========================
+# TEXT HELPERS
+# =========================
 def normalize_url(url: str) -> str:
     return url.split("?")[0].strip()
 
@@ -116,6 +141,55 @@ def strip_html(text: str) -> str:
     return text
 
 
+def truncate_text(text: str, max_len: int) -> str:
+    text = (text or "").strip()
+    if len(text) <= max_len:
+        return text
+    return text[: max_len - 3].rstrip() + "..."
+
+
+def clean_summary(text: str) -> str:
+    if not text:
+        return ""
+
+    text = text.strip()
+
+    banned_patterns = [
+        r"Đây là diễn biến đáng chú ý[^.]*\.",
+        r"Nhà đầu tư nên tiếp tục theo dõi[^.]*\.",
+        r"Đây là thông tin quan trọng[^.]*\.",
+        r"Đáng chú ý để tiếp tục theo dõi[^.]*\.",
+        r"Tin thị trường:\s*",
+        r"Tin pháp lý:\s*",
+        r"Diễn biến DeFi:\s*",
+        r"Cảnh báo bảo mật:\s*",
+        r"Cập nhật hệ sinh thái:\s*",
+        r"Tin đáng chú ý:\s*",
+    ]
+
+    for pattern in banned_patterns:
+        text = re.sub(pattern, "", text, flags=re.IGNORECASE)
+
+    text = re.sub(r"\s+", " ", text).strip()
+
+    return text
+
+
+def clean_title(text: str) -> str:
+    if not text:
+        return ""
+    text = re.sub(r"\s+", " ", text).strip()
+    return truncate_text(text, 110)
+
+
+def format_time_vn(dt_utc: datetime) -> str:
+    vn_tz = timezone(timedelta(hours=7))
+    return dt_utc.astimezone(vn_tz).strftime("%d/%m %H:%M ICT")
+
+
+# =========================
+# TIME HELPERS
+# =========================
 def parse_entry_time(entry) -> Optional[datetime]:
     if getattr(entry, "published_parsed", None):
         try:
@@ -139,27 +213,16 @@ def parse_entry_time(entry) -> Optional[datetime]:
                 return dt.astimezone(timezone.utc)
             except Exception:
                 continue
+
     return None
 
 
-def format_time_vn(dt_utc: datetime) -> str:
-    vn_tz = timezone(timedelta(hours=7))
-    return dt_utc.astimezone(vn_tz).strftime("%d/%m %H:%M ICT")
-
-
-def truncate_text(text: str, max_len: int) -> str:
-    text = (text or "").strip()
-    if len(text) <= max_len:
-        return text
-    return text[: max_len - 3].rstrip() + "..."
-
-
 # =========================
-# Categorize and score
+# CATEGORY + SCORE
 # =========================
 def categorize_article(title: str, summary: str) -> str:
     text = f"{title} {summary}".lower()
-    scores = {}
+    scores: Dict[str, int] = {}
 
     for category, keywords in CATEGORY_RULES.items():
         score = 0
@@ -196,13 +259,13 @@ def score_article(title: str, summary: str, category: str) -> int:
 
 
 # =========================
-# RSS Fetch
+# RSS FETCH
 # =========================
 def fetch_articles() -> List[Dict[str, Any]]:
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(hours=LOOKBACK_HOURS)
     sources = load_sources()
-    all_items = []
+    all_items: List[Dict[str, Any]] = []
 
     for source in sources:
         source_name = source["name"]
@@ -226,34 +289,35 @@ def fetch_articles() -> List[Dict[str, Any]]:
             if published_at is None or published_at < cutoff:
                 continue
 
-            category = categorize_article(title, summary)
-            score = score_article(title, summary, category)
+            clean_snippet = strip_html(summary)
+            category = categorize_article(title, clean_snippet)
+            score = score_article(title, clean_snippet, category)
 
             item = {
                 "id": make_item_id(title, link),
                 "source": source_name,
                 "title": title,
                 "link": normalize_url(link),
-                "summary": strip_html(summary),
+                "summary": clean_snippet,
                 "published_at": published_at,
                 "category": category,
                 "score": score,
             }
             all_items.append(item)
 
-    dedup = {}
+    dedup_by_link: Dict[str, Dict[str, Any]] = {}
     for item in all_items:
-        old = dedup.get(item["link"])
+        old = dedup_by_link.get(item["link"])
         if old is None or item["score"] > old["score"]:
-            dedup[item["link"]] = item
+            dedup_by_link[item["link"]] = item
 
-    items = list(dedup.values())
+    items = list(dedup_by_link.values())
     items.sort(key=lambda x: (x["score"], x["published_at"]), reverse=True)
     return items[:MAX_ITEMS]
 
 
 # =========================
-# Gemini
+# GEMINI
 # =========================
 def build_gemini_client():
     if not GEMINI_API_KEY:
@@ -262,31 +326,21 @@ def build_gemini_client():
 
 
 def fallback_summary_vi(item: Dict[str, Any]) -> Dict[str, str]:
-    category_prefix = {
-        "Market": "Tin thị trường",
-        "Regulation": "Tin pháp lý",
-        "DeFi": "Diễn biến DeFi",
-        "Security": "Cảnh báo bảo mật",
-        "Alt & Ecosystem": "Cập nhật hệ sinh thái",
-        "General": "Tin đáng chú ý"
-    }
-
-    base_summary = item["summary"] or item["title"]
-    base_summary = truncate_text(base_summary, 220)
-
-    summary_vi = f"{category_prefix.get(item['category'], 'Tin đáng chú ý')}: {base_summary}"
-    if not summary_vi.endswith("."):
-        summary_vi += "."
+    title_vi = clean_title(item["title"])
+    summary_vi = clean_summary(truncate_text(item["summary"] or item["title"], 220))
+    tag_line = TAGLINE_MAP_VI.get(item["category"], "Tin đáng chú ý")
 
     return {
-        "title_vi": item["title"],
+        "title_vi": title_vi,
         "summary_vi": summary_vi,
-        "impact_vi": "Đây là diễn biến đáng chú ý để người theo dõi thị trường tiếp tục quan sát.",
-        "tag_line": item["category"]
+        "tag_line": tag_line,
     }
 
 
 def summarize_with_gemini(client, item: Dict[str, Any]) -> Dict[str, str]:
+    if client is None:
+        return fallback_summary_vi(item)
+
     text_block = (
         f"TITLE: {item['title']}\n"
         f"CATEGORY: {item['category']}\n"
@@ -297,36 +351,37 @@ def summarize_with_gemini(client, item: Dict[str, Any]) -> Dict[str, str]:
     )
 
     prompt = f"""
-Bạn là biên tập viên bản tin crypto tiếng Việt chuyên nghiệp.
+Bạn là biên tập viên bản tin crypto tiếng Việt.
 
 Nhiệm vụ:
-Chuyển toàn bộ nội dung bài báo sang tiếng Việt tự nhiên, dễ đọc như một bản tin ngắn trên Discord.
+Dịch và tóm tắt nội dung bài báo thành tiếng Việt tự nhiên, ngắn gọn, dễ đọc trên Discord.
 
-Yêu cầu rất quan trọng:
-- Không giữ lại câu tiếng Anh trong phần tóm tắt, trừ tên riêng như Bitcoin, Ethereum, SEC, ETF.
-- Không chép nguyên văn câu gốc.
-- Không bịa thêm dữ kiện không có trong tiêu đề hoặc đoạn trích.
-- Viết rõ ràng, tự nhiên, gọn, đúng ý.
+YÊU CẦU BẮT BUỘC:
+- Toàn bộ đầu ra phải là tiếng Việt.
+- Không giữ câu tiếng Anh.
+- Chỉ giữ tên riêng hoặc thuật ngữ bắt buộc như Bitcoin, Ethereum, SEC, ETF, Solana.
+- Không dùng văn mẫu.
+- Không thêm câu chung chung như:
+  "Đây là diễn biến đáng chú ý..."
+  "Nhà đầu tư nên tiếp tục theo dõi..."
+  "Đây là thông tin quan trọng..."
+- Không bịa thêm dữ kiện ngoài nội dung đã cho.
 
-Hãy trả về đúng 4 trường sau:
+Trả về JSON gồm đúng 3 trường:
 
 1. title_vi
 - Viết lại tiêu đề hoàn toàn bằng tiếng Việt.
-- Tự nhiên, dễ hiểu, tối đa 110 ký tự.
+- Ngắn gọn, dễ hiểu, tối đa 110 ký tự.
 
 2. summary_vi
-- Viết 2-3 câu tiếng Việt.
-- Dài khoảng 60-100 từ.
-- Tóm tắt lại nội dung theo văn phong bản tin.
-- Không lẫn tiếng Anh.
+- Viết đúng 2 câu tiếng Việt.
+- Súc tích, nhiều thông tin.
+- Không lặp lại nguyên ý của tiêu đề.
+- Không dùng tiếng Anh.
 
-3. impact_vi
-- Viết 1 câu tiếng Việt ngắn.
-- Giải thích vì sao tin này đáng chú ý với người theo dõi thị trường crypto.
-
-4. tag_line
-- Viết nhãn ngắn 2-5 từ bằng tiếng Việt.
-- Ví dụ: "Biến động giá", "Hack giao thức", "Cập nhật ETF", "Tin pháp lý"
+3. tag_line
+- Viết nhãn ngắn 2 đến 4 từ bằng tiếng Việt.
+- Ví dụ: "Tin pháp lý", "Biến động giá", "Cập nhật DeFi", "Tin ETF"
 
 Dữ liệu bài báo:
 {text_block}
@@ -337,23 +392,32 @@ Dữ liệu bài báo:
             model=GEMINI_MODEL,
             contents=prompt,
             config=types.GenerateContentConfig(
-                temperature=0.4,
+                temperature=0.3,
                 response_mime_type="application/json",
                 response_schema=NewsSummary,
-                max_output_tokens=500,
+                max_output_tokens=400,
             ),
         )
 
         data = response.parsed
-        if data:
-            return {
-                "title_vi": data.title_vi.strip(),
-                "summary_vi": data.summary_vi.strip(),
-                "impact_vi": data.impact_vi.strip(),
-                "tag_line": data.tag_line.strip(),
-            }
+        if not data:
+            return fallback_summary_vi(item)
 
-        return fallback_summary_vi(item)
+        title_vi = clean_title(data.title_vi)
+        summary_vi = clean_summary(data.summary_vi)
+        tag_line = truncate_text((data.tag_line or "").strip(), 30)
+
+        if not title_vi or not summary_vi:
+            return fallback_summary_vi(item)
+
+        if not tag_line:
+            tag_line = TAGLINE_MAP_VI.get(item["category"], "Tin đáng chú ý")
+
+        return {
+            "title_vi": title_vi,
+            "summary_vi": summary_vi,
+            "tag_line": tag_line,
+        }
 
     except Exception as e:
         print(f"[WARN] Gemini failed for {item['title'][:80]}: {e}")
@@ -362,13 +426,12 @@ Dữ liệu bài báo:
 
 def enrich_articles_with_ai(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     client = build_gemini_client()
-    enriched = []
+    enriched: List[Dict[str, Any]] = []
 
     for item in items:
-        ai_result = summarize_with_gemini(client, item) if client else fallback_summary_vi(item)
+        ai_result = summarize_with_gemini(client, item)
         item["title_vi"] = ai_result["title_vi"]
         item["summary_vi"] = ai_result["summary_vi"]
-        item["impact_vi"] = ai_result["impact_vi"]
         item["tag_line"] = ai_result["tag_line"]
         enriched.append(item)
 
@@ -376,7 +439,7 @@ def enrich_articles_with_ai(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]
 
 
 # =========================
-# Discord formatting
+# GROUPING
 # =========================
 def group_items(items: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
     grouped: Dict[str, List[Dict[str, Any]]] = {}
@@ -391,6 +454,14 @@ def group_items(items: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
     return grouped
 
 
+def chunk_list(arr: List[Any], n: int):
+    for i in range(0, len(arr), n):
+        yield arr[i:i + n]
+
+
+# =========================
+# DISCORD FORMAT
+# =========================
 def build_embed_fields(grouped: Dict[str, List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
     ordered_categories = ["Market", "Regulation", "DeFi", "Security", "Alt & Ecosystem", "General"]
     fields: List[Dict[str, Any]] = []
@@ -400,19 +471,18 @@ def build_embed_fields(grouped: Dict[str, List[Dict[str, Any]]]) -> List[Dict[st
             continue
 
         emoji = CATEGORY_EMOJI.get(category, "📰")
-        blocks = []
+        category_label = CATEGORY_LABEL_VI.get(category, category)
+        blocks: List[str] = []
 
         for item in grouped[category]:
             title_vi = truncate_text(item.get("title_vi", item["title"]), 100)
-            summary_vi = truncate_text(item.get("summary_vi", item["summary"]), 320)
-            impact_vi = truncate_text(item.get("impact_vi", "Đáng chú ý để tiếp tục theo dõi."), 120)
-            tag_line = truncate_text(item.get("tag_line", category), 30)
+            summary_vi = truncate_text(clean_summary(item.get("summary_vi", item["summary"])), 320)
+            tag_line = truncate_text(item.get("tag_line", TAGLINE_MAP_VI.get(category, "Tin đáng chú ý")), 30)
 
             block = (
                 f"**[{title_vi}]({item['link']})**\n"
                 f"*{tag_line}*\n"
                 f"{summary_vi}\n"
-                f"↳ {impact_vi}\n"
                 f"`{item['source']}` • {format_time_vn(item['published_at'])}"
             )
             blocks.append(block)
@@ -421,17 +491,12 @@ def build_embed_fields(grouped: Dict[str, List[Dict[str, Any]]]) -> List[Dict[st
         field_value = truncate_text(field_value, 1024)
 
         fields.append({
-            "name": f"{emoji} {category}",
+            "name": f"{emoji} {category_label}",
             "value": field_value,
             "inline": False
         })
 
     return fields
-
-
-def chunk_list(arr: List[Any], n: int):
-    for i in range(0, len(arr), n):
-        yield arr[i:i + n]
 
 
 def build_discord_payload(items: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -458,12 +523,12 @@ def build_discord_payload(items: List[Dict[str, Any]]) -> Dict[str, Any]:
             "title": f"Crypto Daily Brief | {now_vn}" if idx == 1 else f"Crypto Daily Brief | phần {idx}",
             "description": (
                 f"Tổng hợp tin crypto trong {LOOKBACK_HOURS} giờ gần nhất.\n"
-                f"Tóm tắt tiếng Việt để bạn đọc nhanh, gọn và đỡ rối giữa dòng tin."
+                f"Tóm tắt hoàn toàn bằng tiếng Việt, ngắn gọn và dễ đọc."
             ) if idx == 1 else "Tiếp tục bản tin.",
             "color": EMBED_COLOR,
             "fields": field_group,
             "footer": {
-                "text": f"{len(items)} tin • RSS + Gemini summary • Auto digest"
+                "text": f"{len(items)} tin • RSS + Gemini • Auto digest"
             },
             "timestamp": datetime.now(timezone.utc).isoformat()
         }
@@ -475,6 +540,9 @@ def build_discord_payload(items: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+# =========================
+# DISCORD SEND
+# =========================
 def send_to_discord(payload: Dict[str, Any]) -> None:
     if not DISCORD_WEBHOOK_URL:
         raise ValueError("Missing DISCORD_WEBHOOK_URL")
@@ -485,7 +553,7 @@ def send_to_discord(payload: Dict[str, Any]) -> None:
 
 
 # =========================
-# Main
+# MAIN
 # =========================
 def main() -> None:
     state = load_state()
@@ -500,11 +568,13 @@ def main() -> None:
         print("No new items, sent empty digest.")
         return
 
-    enriched_items = enrich_articles_with_ai(new_items[:MAX_ITEMS])
+    selected_items = new_items[:MAX_ITEMS]
+    enriched_items = enrich_articles_with_ai(selected_items)
+
     payload = build_discord_payload(enriched_items)
     send_to_discord(payload)
 
-    for item in new_items[:MAX_ITEMS]:
+    for item in selected_items:
         posted_ids.add(item["id"])
 
     state["posted_ids"] = list(posted_ids)[-1500:]
