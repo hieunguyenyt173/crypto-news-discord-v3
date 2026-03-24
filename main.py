@@ -14,6 +14,12 @@ from pydantic import BaseModel
 from google import genai
 from google.genai import types
 
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
 
 # =========================
 # ENV CONFIG
@@ -25,6 +31,7 @@ LOOKBACK_HOURS = int(os.getenv("LOOKBACK_HOURS", "12"))
 MAX_ITEMS = int(os.getenv("MAX_ITEMS", "10"))
 MAX_PER_CATEGORY = int(os.getenv("MAX_PER_CATEGORY", "3"))
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
+TEST_MODE = os.getenv("TEST_MODE", "false").lower() == "true"
 
 STATE_FILE = "posted_state.json"
 SOURCES_FILE = "sources.json"
@@ -185,13 +192,17 @@ def is_mostly_english(text: str) -> bool:
     if not text:
         return False
 
-    letters = re.findall(r"[A-Za-z]", text)
-    if len(letters) < 8:
+    text = text.strip()
+    ascii_letters = len(re.findall(r"[A-Za-z]", text))
+    vi_letters = len(re.findall(
+        r"[ăâđêôơưáàảãạấầẩẫậắằẳẵặéèẻẽẹếềểễệíìỉĩịóòỏõọốồổỗộớờởỡợúùủũụứừửữựýỳỷỹỵ]",
+        text.lower()
+    ))
+
+    if ascii_letters < 6:
         return False
 
-    vietnamese_chars = re.findall(r"[ăâđêôơưáàảãạấầẩẫậắằẳẵặéèẻẽẹếềểễệíìỉĩịóòỏõọốồổỗộớờởỡợúùủũụứừửữựýỳỷỹỵ]", text.lower())
-
-    return len(vietnamese_chars) == 0
+    return vi_letters == 0
 
 
 def format_time_vn(dt_utc: datetime) -> str:
@@ -329,7 +340,7 @@ def fetch_articles() -> List[Dict[str, Any]]:
 
 
 # =========================
-# GEMINI
+# GEMINI HELPERS
 # =========================
 def build_gemini_client():
     if not GEMINI_API_KEY:
@@ -337,38 +348,23 @@ def build_gemini_client():
     return genai.Client(api_key=GEMINI_API_KEY)
 
 
-def fallback_summary_vi(item: Dict[str, Any]) -> Dict[str, str]:
-    title_vi = clean_title(item["title"])
-    summary_vi = clean_summary(truncate_text(item["summary"] or item["title"], 220))
-    tag_line = TAGLINE_MAP_VI.get(item["category"], "Tin đáng chú ý")
-
-    if is_mostly_english(title_vi):
-        title_vi = f"Tin mới: {clean_title(item['title'])}"
-
-    return {
-        "title_vi": title_vi,
-        "summary_vi": summary_vi,
-        "tag_line": tag_line,
-    }
-
-
 def translate_title_vi(client, title: str) -> str:
-    clean_original = clean_title(title)
+    original = clean_title(title)
+
     if not client:
-        return f"Tin mới: {clean_original}"
+        return original
 
     prompt = f"""
-Dịch tiêu đề tin tức crypto sau sang tiếng Việt tự nhiên.
+Dịch tiêu đề tin crypto sau sang tiếng Việt tự nhiên.
 
 Yêu cầu:
-- Dịch sang tiếng Việt tối đa có thể.
-- Không giữ tiếng Anh.
-- Chỉ giữ lại tên riêng hoặc thuật ngữ bắt buộc như Bitcoin, Ethereum, SEC, ETF, Solana.
+- Dịch tối đa sang tiếng Việt.
+- Chỉ giữ lại tên riêng bắt buộc như Bitcoin, Ethereum, SEC, ETF, Solana.
 - Không thêm thông tin mới.
-- Chỉ trả về đúng một dòng tiêu đề.
+- Chỉ trả về đúng 1 dòng tiêu đề tiếng Việt.
 
 Tiêu đề:
-{clean_original}
+{original}
 """.strip()
 
     try:
@@ -380,22 +376,77 @@ Tiêu đề:
                 max_output_tokens=80,
             ),
         )
-
-        translated = clean_title((response.text or "").strip())
-        if not translated:
-            return f"Tin mới: {clean_original}"
-
-        if is_mostly_english(translated):
-            return f"Tin mới: {clean_original}"
-
-        return translated
+        result = clean_title((response.text or "").strip())
+        return result if result else original
     except Exception:
-        return f"Tin mới: {clean_original}"
+        return original
+
+
+def translate_summary_vi(client, title: str, summary: str) -> str:
+    source_text = clean_summary(summary or title)
+
+    if not source_text:
+        return ""
+
+    if not client:
+        return source_text
+
+    prompt = f"""
+Dịch và viết lại đoạn tin crypto sau thành tiếng Việt tự nhiên.
+
+Yêu cầu:
+- Chỉ viết đúng 2 câu tiếng Việt.
+- Không giữ câu tiếng Anh.
+- Không văn mẫu, không thêm câu sáo rỗng.
+- Không thêm dữ kiện ngoài nội dung gốc.
+- Giọng văn ngắn gọn, kiểu bản tin.
+
+Tiêu đề:
+{title}
+
+Nội dung:
+{source_text}
+""".strip()
+
+    try:
+        response = client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                temperature=0.3,
+                max_output_tokens=160,
+            ),
+        )
+        result = clean_summary((response.text or "").strip())
+        return result if result else source_text
+    except Exception:
+        return source_text
+
+
+def fallback_summary_vi(item: Dict[str, Any], client=None) -> Dict[str, str]:
+    title_vi = translate_title_vi(client, item["title"])
+    summary_vi = translate_summary_vi(client, item["title"], item["summary"])
+    tag_line = TAGLINE_MAP_VI.get(item["category"], "Tin đáng chú ý")
+
+    title_vi = clean_title(title_vi)
+    summary_vi = clean_summary(summary_vi)
+
+    if not title_vi:
+        title_vi = clean_title(item["title"])
+
+    if not summary_vi:
+        summary_vi = clean_summary(truncate_text(item["summary"] or item["title"], 220))
+
+    return {
+        "title_vi": title_vi,
+        "summary_vi": summary_vi,
+        "tag_line": tag_line,
+    }
 
 
 def summarize_with_gemini(client, item: Dict[str, Any]) -> Dict[str, str]:
     if client is None:
-        return fallback_summary_vi(item)
+        return fallback_summary_vi(item, client=None)
 
     text_block = (
         f"TITLE: {item['title']}\n"
@@ -409,38 +460,18 @@ def summarize_with_gemini(client, item: Dict[str, Any]) -> Dict[str, str]:
     prompt = f"""
 Bạn là biên tập viên bản tin crypto tiếng Việt.
 
-Nhiệm vụ:
-Dịch và tóm tắt nội dung bài báo thành tiếng Việt tự nhiên, ngắn gọn, dễ đọc trên Discord.
+Hãy đọc dữ liệu bài báo và trả về JSON đúng schema với 3 trường:
+- title_vi
+- summary_vi
+- tag_line
 
-YÊU CẦU BẮT BUỘC:
-- Toàn bộ đầu ra phải là tiếng Việt.
-- Không giữ câu tiếng Anh.
-- Chỉ giữ tên riêng hoặc thuật ngữ bắt buộc như Bitcoin, Ethereum, SEC, ETF, Solana.
-- Không dùng văn mẫu.
-- Không thêm câu chung chung như:
-  "Đây là diễn biến đáng chú ý..."
-  "Nhà đầu tư nên tiếp tục theo dõi..."
-  "Đây là thông tin quan trọng..."
-- Không bịa thêm dữ kiện ngoài nội dung đã cho.
+Yêu cầu:
+- title_vi phải là tiếng Việt, không để tiếng Anh trừ tên riêng bắt buộc.
+- summary_vi phải là đúng 2 câu tiếng Việt, ngắn gọn, giàu thông tin.
+- Không dùng câu sáo rỗng như "đây là diễn biến đáng chú ý".
+- Không thêm dữ kiện ngoài dữ liệu gốc.
 
-Trả về JSON gồm đúng 3 trường:
-
-1. title_vi
-- DỊCH tiêu đề sang tiếng Việt.
-- Không được giữ tiếng Anh, trừ tên riêng bắt buộc.
-- Ngắn gọn, dễ hiểu, tối đa 110 ký tự.
-
-2. summary_vi
-- Viết đúng 2 câu tiếng Việt.
-- Súc tích, nhiều thông tin.
-- Không lặp lại nguyên ý của tiêu đề.
-- Không dùng tiếng Anh.
-
-3. tag_line
-- Viết nhãn ngắn 2 đến 4 từ bằng tiếng Việt.
-- Ví dụ: "Tin pháp lý", "Biến động giá", "Cập nhật DeFi", "Tin ETF"
-
-Dữ liệu bài báo:
+Dữ liệu:
 {text_block}
 """.strip()
 
@@ -458,33 +489,30 @@ Dữ liệu bài báo:
 
         data = response.parsed
         if not data:
-            return fallback_summary_vi(item)
+            return fallback_summary_vi(item, client)
 
-        title_vi = clean_title(data.title_vi)
-        summary_vi = clean_summary(data.summary_vi)
+        title_vi = clean_title((data.title_vi or "").strip())
+        summary_vi = clean_summary((data.summary_vi or "").strip())
         tag_line = truncate_text((data.tag_line or "").strip(), 30)
 
-        if not title_vi:
+        if not title_vi or is_mostly_english(title_vi):
             title_vi = translate_title_vi(client, item["title"])
 
-        if is_mostly_english(title_vi):
-            title_vi = translate_title_vi(client, item["title"])
-
-        if not summary_vi:
-            return fallback_summary_vi(item)
+        if not summary_vi or is_mostly_english(summary_vi):
+            summary_vi = translate_summary_vi(client, item["title"], item["summary"])
 
         if not tag_line:
             tag_line = TAGLINE_MAP_VI.get(item["category"], "Tin đáng chú ý")
 
         return {
-            "title_vi": title_vi,
-            "summary_vi": summary_vi,
+            "title_vi": clean_title(title_vi),
+            "summary_vi": clean_summary(summary_vi),
             "tag_line": tag_line,
         }
 
     except Exception as e:
         print(f"[WARN] Gemini failed for {item['title'][:80]}: {e}")
-        return fallback_summary_vi(item)
+        return fallback_summary_vi(item, client)
 
 
 def enrich_articles_with_ai(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -538,8 +566,8 @@ def build_embed_fields(grouped: Dict[str, List[Dict[str, Any]]]) -> List[Dict[st
         blocks: List[str] = []
 
         for item in grouped[category]:
-            title_vi = truncate_text(item.get("title_vi", item["title"]), 100)
-            summary_vi = truncate_text(clean_summary(item.get("summary_vi", item["summary"])), 320)
+            title_vi = truncate_text(clean_title(item.get("title_vi") or item["title"]), 100)
+            summary_vi = truncate_text(clean_summary(item.get("summary_vi") or item["summary"]), 320)
             tag_line = truncate_text(item.get("tag_line", TAGLINE_MAP_VI.get(category, "Tin đáng chú ý")), 30)
 
             block = (
@@ -623,7 +651,11 @@ def main() -> None:
     posted_ids = set(state.get("posted_ids", []))
 
     items = fetch_articles()
-    new_items = [item for item in items if item["id"] not in posted_ids]
+
+    if TEST_MODE:
+        new_items = items[:MAX_ITEMS]
+    else:
+        new_items = [item for item in items if item["id"] not in posted_ids]
 
     if not new_items:
         payload = build_discord_payload([])
@@ -637,11 +669,12 @@ def main() -> None:
     payload = build_discord_payload(enriched_items)
     send_to_discord(payload)
 
-    for item in selected_items:
-        posted_ids.add(item["id"])
+    if not TEST_MODE:
+        for item in selected_items:
+            posted_ids.add(item["id"])
 
-    state["posted_ids"] = list(posted_ids)[-1500:]
-    save_state(state)
+        state["posted_ids"] = list(posted_ids)[-1500:]
+        save_state(state)
 
     print(f"Posted {len(enriched_items)} new items.")
 
