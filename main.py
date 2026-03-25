@@ -27,8 +27,8 @@ DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
 LOOKBACK_HOURS = int(os.getenv("LOOKBACK_HOURS", "12"))
-MAX_ITEMS = int(os.getenv("MAX_ITEMS", "6"))
-MAX_PER_CATEGORY = int(os.getenv("MAX_PER_CATEGORY", "2"))
+MAX_ITEMS = int(os.getenv("MAX_ITEMS", "4"))
+MAX_PER_CATEGORY = int(os.getenv("MAX_PER_CATEGORY", "1"))
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
 TEST_MODE = os.getenv("TEST_MODE", "false").lower() == "true"
 STRICT_VIETNAMESE = os.getenv("STRICT_VIETNAMESE", "true").lower() == "true"
@@ -78,15 +78,6 @@ CATEGORY_LABEL_VI = {
     "Security": "Bảo mật",
     "Alt & Ecosystem": "Hệ sinh thái",
     "General": "Tổng hợp"
-}
-
-CATEGORY_EMOJI = {
-    "Market": "📈",
-    "Regulation": "⚖️",
-    "DeFi": "🏦",
-    "Security": "🛡️",
-    "Alt & Ecosystem": "🧩",
-    "General": "📰"
 }
 
 
@@ -185,8 +176,6 @@ def count_bullets(text: str) -> int:
 def is_digest_mostly_vietnamese(text: str) -> bool:
     if not text:
         return False
-
-    text = text.strip()
 
     ascii_words = re.findall(r"\b[a-zA-Z]{3,}\b", text)
     vietnamese_chars = re.findall(
@@ -320,7 +309,7 @@ def fetch_articles() -> List[Dict[str, Any]]:
                 "source": source_name,
                 "title": title,
                 "link": normalize_url(link),
-                "summary": truncate_text(clean_snippet, 700),
+                "summary": truncate_text(clean_snippet, 350),
                 "published_at": published_at,
                 "category": category,
                 "score": score,
@@ -398,6 +387,7 @@ def build_gemini_client():
 
 
 def build_digest_prompt(items: List[Dict[str, Any]]) -> str:
+    total_items = len(items)
     news_blocks = []
 
     for i, item in enumerate(items, start=1):
@@ -405,122 +395,122 @@ def build_digest_prompt(items: List[Dict[str, Any]]) -> str:
             (
                 f"TIN {i}\n"
                 f"Nguồn: {item['source']}\n"
-                f"Chuyên mục gợi ý: {CATEGORY_LABEL_VI.get(item['category'], 'Tổng hợp')}\n"
-                f"Thời gian: {format_time_vn(item['published_at'])}\n"
-                f"Tiêu đề gốc: {item['title']}\n"
-                f"Tóm tắt gốc: {item['summary']}\n"
-                f"Link: {item['link']}"
+                f"Mục: {CATEGORY_LABEL_VI.get(item['category'], 'Tổng hợp')}\n"
+                f"Giờ: {format_time_vn(item['published_at'])}\n"
+                f"Tiêu đề: {item['title']}\n"
+                f"Nội dung: {item['summary']}"
             )
         )
 
     joined = "\n\n".join(news_blocks)
-    total_items = len(items)
 
     return f"""
-Bạn là biên tập viên bản tin crypto tiếng Việt cho Discord.
+Viết bản tin crypto tiếng Việt cho Discord từ danh sách dưới đây.
 
-Hãy viết lại toàn bộ danh sách tin dưới đây thành MỘT bản tin hoàn chỉnh bằng tiếng Việt.
+BẮT BUỘC:
+- Dùng đủ đúng {total_items} tin.
+- Kết quả phải có đúng {total_items} bullet, mỗi bullet bắt đầu bằng "•".
+- Không bỏ sót tin.
+- Không gộp nhiều tin làm một.
+- 100% tiếng Việt, trừ tên riêng bắt buộc như Bitcoin, Ethereum, SEC, ETF, Tether, Solana, Coinbase.
+- Mỗi tin 1 đến 2 câu ngắn.
+- Không dùng câu sáo rỗng.
+- Không thêm mở đầu hoặc kết luận.
 
-YÊU CẦU BẮT BUỘC:
-- Phải dùng đủ cả {total_items} tin.
-- Không được bỏ sót tin nào.
-- Mỗi tin tương ứng đúng 1 bullet bắt đầu bằng ký tự "•".
-- Tổng số bullet trong kết quả phải đúng bằng {total_items}.
-- Không gộp hai tin thành một.
-- Toàn bộ nội dung phải là tiếng Việt.
-- Không giữ câu tiếng Anh, trừ tên riêng bắt buộc như Bitcoin, Ethereum, SEC, ETF, Tether, Solana, Coinbase.
-- Không dùng câu sáo rỗng như:
-  "Đây là diễn biến đáng chú ý..."
-  "Nhà đầu tư nên tiếp tục theo dõi..."
-  "Đây là thông tin quan trọng..."
-- Không bịa thêm dữ kiện ngoài dữ liệu gốc.
-- Văn phong ngắn gọn, tự nhiên, dễ đọc trên Discord.
-- Mỗi tin viết 1 đến 2 câu.
-- Nhóm theo các mục nếu phù hợp:
-  📈 Thị trường
-  ⚖️ Pháp lý
-  🏦 DeFi
-  🛡️ Bảo mật
-  🧩 Hệ sinh thái
-  📰 Tổng hợp
+Nhóm theo mục nếu phù hợp:
+📈 Thị trường
+⚖️ Pháp lý
+🏦 DeFi
+🛡️ Bảo mật
+🧩 Hệ sinh thái
+📰 Tổng hợp
 
-Với mỗi tin, ghi đúng cấu trúc:
+Mỗi tin theo mẫu:
 • [Tiêu đề tiếng Việt]
-[Tóm tắt 1 đến 2 câu]
+[Tóm tắt]
 Nguồn: [Tên nguồn] • [Thời gian]
 
-- Không dùng markdown link.
-- Không thêm lời mở đầu.
-- Không thêm kết luận.
-- Chỉ trả về phần nội dung bản tin.
-
-DANH SÁCH TIN:
+DANH SÁCH:
 {joined}
 """.strip()
+
+
+def call_gemini_once(client, items: List[Dict[str, Any]], max_output_tokens: int) -> str:
+    prompt = build_digest_prompt(items)
+
+    response = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            temperature=0.2,
+            max_output_tokens=max_output_tokens,
+        ),
+    )
+
+    return cleanup_digest_text((response.text or "").strip())
 
 
 def generate_digest_text(client, items: List[Dict[str, Any]]) -> str:
     if not items:
         return f"Không có tin mới nổi bật trong {LOOKBACK_HOURS} giờ gần đây."
 
-    prompt = build_digest_prompt(items)
-    expected_bullets = len(items)
+    if client is None:
+        raise RuntimeError("Gemini client is not available")
 
+    expected_bullets = len(items)
     log(f"[INFO] Sending {expected_bullets} items to Gemini with model={GEMINI_MODEL}")
 
-    last_error = None
+    try:
+        text = call_gemini_once(client, items, max_output_tokens=1200)
+    except Exception as e:
+        raise RuntimeError(f"Gemini API call failed: {e}")
 
-    for attempt in range(1, 4):
-        log(f"[INFO] Gemini attempt {attempt}")
+    log("[DEBUG] Gemini raw output preview:")
+    log(text[:1200] if text else "[EMPTY]")
 
-        try:
-            response = client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    temperature=0.2,
-                    max_output_tokens=2200,
-                ),
-            )
-        except Exception as e:
-            last_error = f"Gemini API call failed: {e}"
-            log(f"[WARN] {last_error}")
-            continue
+    if not text:
+        raise RuntimeError("Gemini returned empty digest")
 
-        text = cleanup_digest_text((response.text or "").strip())
+    bullet_count = count_bullets(text)
+    log(f"[CHECK] bullet_count={bullet_count} | expected={expected_bullets}")
 
-        log("[DEBUG] Gemini raw output preview:")
-        log(text[:1500] if text else "[EMPTY]")
+    if STRICT_VIETNAMESE and not is_digest_mostly_vietnamese(text):
+        raise RuntimeError("Digest is still mostly English")
 
-        if not text:
-            last_error = "Gemini returned empty digest"
-            log(f"[WARN] {last_error}")
-            continue
-
-        bullet_count = count_bullets(text)
-        log(f"[CHECK] bullet_count={bullet_count} | expected={expected_bullets}")
-
-        if STRICT_VIETNAMESE and not is_digest_mostly_vietnamese(text):
-            last_error = "Digest is still mostly English"
-            log(f"[WARN] {last_error}")
-            continue
-
-        if bullet_count < expected_bullets:
-            last_error = f"Digest returned too few items: got {bullet_count}, expected {expected_bullets}"
-            log(f"[WARN] {last_error}")
-
-            prompt = prompt + f"""
-
-NHẮC LẠI:
-- Kết quả trước đó bị thiếu tin.
-- Bạn PHẢI viết đủ đúng {expected_bullets} bullet bắt đầu bằng "•".
-- Không được bỏ sót bất kỳ TIN nào từ TIN 1 đến TIN {expected_bullets}.
-"""
-            continue
-
+    if bullet_count >= expected_bullets:
         return text
 
-    raise RuntimeError(last_error or "Gemini digest generation failed")
+    # fallback tiết kiệm quota: chỉ gọi thêm 1 lần với ít tin hơn
+    if len(items) > 2:
+        smaller_items = items[: min(4, len(items))]
+        fallback_expected = len(smaller_items)
+        log(f"[WARN] Too few bullets, fallback with fewer items: {fallback_expected}")
+
+        try:
+            smaller_text = call_gemini_once(client, smaller_items, max_output_tokens=900)
+        except Exception as e:
+            raise RuntimeError(f"Fallback Gemini call failed: {e}")
+
+        log("[DEBUG] Gemini fallback output preview:")
+        log(smaller_text[:1200] if smaller_text else "[EMPTY]")
+
+        if not smaller_text:
+            raise RuntimeError("Fallback Gemini returned empty digest")
+
+        smaller_bullet_count = count_bullets(smaller_text)
+        log(f"[CHECK] fallback_bullet_count={smaller_bullet_count} | expected={fallback_expected}")
+
+        if STRICT_VIETNAMESE and not is_digest_mostly_vietnamese(smaller_text):
+            raise RuntimeError("Fallback digest is still mostly English")
+
+        if smaller_bullet_count >= fallback_expected:
+            return smaller_text
+
+        raise RuntimeError(
+            f"Digest returned too few items: got {bullet_count}, fallback got {smaller_bullet_count}"
+        )
+
+    raise RuntimeError(f"Digest returned too few items: got {bullet_count}, expected {expected_bullets}")
 
 
 # =========================
@@ -642,7 +632,8 @@ def main() -> None:
     client = build_gemini_client()
     digest_text = generate_digest_text(client, candidate_items)
 
-    payload = build_discord_payload_from_digest(digest_text, len(candidate_items))
+    sent_items_count = count_bullets(digest_text) or len(candidate_items)
+    payload = build_discord_payload_from_digest(digest_text, sent_items_count)
     send_to_discord(payload)
     log("[INFO] Discord message sent successfully")
 
