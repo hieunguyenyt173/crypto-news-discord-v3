@@ -1,654 +1,217 @@
 import os
-import re
 import json
 import time
-import html
 import hashlib
-from typing import List, Dict, Any, Optional
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 
-import feedparser
 import requests
-from google import genai
-from google.genai import types
-
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except Exception:
-    pass
-
+import feedparser
+from openai import OpenAI
 
 # =========================
-# ENV CONFIG
+# CONFIG
 # =========================
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "").strip()
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "").strip()
 
-LOOKBACK_HOURS = int(os.getenv("LOOKBACK_HOURS", "12"))
-MAX_ITEMS = int(os.getenv("MAX_ITEMS", "4"))
-MAX_PER_CATEGORY = int(os.getenv("MAX_PER_CATEGORY", "1"))
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
-TEST_MODE = os.getenv("TEST_MODE", "false").lower() == "true"
-STRICT_VIETNAMESE = os.getenv("STRICT_VIETNAMESE", "true").lower() == "true"
-DEBUG_LOG = os.getenv("DEBUG_LOG", "true").lower() == "true"
+# Có thể đổi / thêm nguồn RSS ở đây
+RSS_FEEDS = [
+    "https://www.coindesk.com/arc/outboundfeeds/rss/",
+    "https://cointelegraph.com/rss",
+    "https://decrypt.co/feed",
+    "https://www.theblock.co/rss.xml",
+]
 
-STATE_FILE = "posted_state.json"
-SOURCES_FILE = "sources.json"
-
-EMBED_COLOR = 3447003
-
+STATE_FILE = "sent_state.json"
+MAX_ARTICLES_TO_FETCH = 30
+MAX_ARTICLES_TO_SUMMARIZE = 5
 
 # =========================
-# CATEGORY CONFIG
+# DEEPSEEK CLIENT
 # =========================
-CATEGORY_RULES = {
-    "Market": [
-        "bitcoin", "btc", "ethereum", "eth", "solana", "sol",
-        "price", "market", "rally", "surge", "plunge", "volatility",
-        "liquidation", "whale", "altcoin", "token", "bull", "bear",
-        "flows", "volume", "open interest"
-    ],
-    "Regulation": [
-        "sec", "etf", "regulation", "lawsuit", "law", "court",
-        "congress", "policy", "ban", "approval", "reject", "compliance",
-        "legal", "regulator"
-    ],
-    "DeFi": [
-        "defi", "dex", "yield", "staking", "lending", "borrowing",
-        "amm", "vault", "liquidity", "tvl", "farm", "stablecoin",
-        "restaking", "bridge"
-    ],
-    "Security": [
-        "hack", "exploit", "breach", "attack", "drain", "phishing",
-        "security", "vulnerability", "stolen", "scam"
-    ],
-    "Alt & Ecosystem": [
-        "airdrop", "mainnet", "testnet", "ecosystem", "partnership",
-        "launch", "upgrade", "listing", "protocol", "foundation",
-        "web3", "nft", "gaming", "infra", "layer 2", "l2"
-    ]
-}
-
-CATEGORY_LABEL_VI = {
-    "Market": "Thị trường",
-    "Regulation": "Pháp lý",
-    "DeFi": "DeFi",
-    "Security": "Bảo mật",
-    "Alt & Ecosystem": "Hệ sinh thái",
-    "General": "Tổng hợp"
-}
-
+client = OpenAI(
+    api_key=DEEPSEEK_API_KEY,
+    base_url="https://api.deepseek.com"
+)
 
 # =========================
-# LOGGING
+# HELPERS
 # =========================
-def log(message: str) -> None:
-    if DEBUG_LOG:
-        print(message)
+def load_state():
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {"sent_ids": []}
+    return {"sent_ids": []}
 
-
-# =========================
-# FILE / STATE HELPERS
-# =========================
-def load_sources() -> List[Dict[str, str]]:
-    with open(SOURCES_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def load_state() -> Dict[str, Any]:
-    if not os.path.exists(STATE_FILE):
-        return {"posted_ids": []}
-    with open(STATE_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def save_state(state: Dict[str, Any]) -> None:
+def save_state(state):
     with open(STATE_FILE, "w", encoding="utf-8") as f:
         json.dump(state, f, ensure_ascii=False, indent=2)
 
+def make_article_id(link: str, title: str) -> str:
+    raw = f"{link}|{title}".encode("utf-8")
+    return hashlib.md5(raw).hexdigest()
 
-# =========================
-# TEXT HELPERS
-# =========================
-def normalize_url(url: str) -> str:
-    return url.split("?")[0].strip()
-
-
-def make_item_id(title: str, link: str) -> str:
-    raw = f"{title.strip().lower()}|{normalize_url(link)}"
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
-
-
-def strip_html(text: str) -> str:
-    if not text:
-        return ""
-    text = html.unescape(text)
-    text = re.sub(r"<[^>]+>", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
-
-
-def truncate_text(text: str, max_len: int) -> str:
-    text = (text or "").strip()
-    if len(text) <= max_len:
-        return text
-    return text[: max_len - 3].rstrip() + "..."
-
-
-def cleanup_digest_text(text: str) -> str:
-    if not text:
-        return ""
-
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-
-    banned_patterns = [
-        r"Đây là diễn biến đáng chú ý[^.\n]*\.?",
-        r"Nhà đầu tư nên tiếp tục theo dõi[^.\n]*\.?",
-        r"Đây là thông tin quan trọng[^.\n]*\.?",
-        r"Tin đáng chú ý[^.\n]*\.?",
-        r"Dưới đây là bản tin[^.\n]*\.?",
-    ]
-
-    for pattern in banned_patterns:
-        text = re.sub(pattern, "", text, flags=re.IGNORECASE)
-
-    text = re.sub(r"\n{3,}", "\n\n", text).strip()
-    return text
-
-
-def format_time_vn(dt_utc: datetime) -> str:
-    vn_tz = timezone(timedelta(hours=7))
-    return dt_utc.astimezone(vn_tz).strftime("%d/%m %H:%M ICT")
-
-
-def now_vn_str() -> str:
-    return datetime.now(timezone(timedelta(hours=7))).strftime("%d/%m/%Y %H:%M ICT")
-
-
-def count_bullets(text: str) -> int:
-    if not text:
-        return 0
-    return len(re.findall(r"^\s*•", text, flags=re.MULTILINE))
-
-
-def is_digest_mostly_vietnamese(text: str) -> bool:
-    if not text:
-        return False
-
-    ascii_words = re.findall(r"\b[a-zA-Z]{3,}\b", text)
-    vietnamese_chars = re.findall(
-        r"[ăâđêôơưáàảãạấầẩẫậắằẳẵặéèẻẽẹếềểễệíìỉĩịóòỏõọốồổỗộớờởỡợúùủũụứừửữựýỳỷỹỵ]",
-        text.lower()
-    )
-
-    bullet_count = text.count("•")
-    source_count = text.count("Nguồn:")
-
-    log(f"[CHECK] ascii_words={len(ascii_words)} | vietnamese_chars={len(vietnamese_chars)} | bullets={bullet_count} | sources={source_count}")
-
-    if len(vietnamese_chars) >= 20 and bullet_count >= 1 and source_count >= 1:
-        return True
-
-    return len(ascii_words) < 25
-
-
-# =========================
-# TIME HELPERS
-# =========================
-def parse_entry_time(entry) -> Optional[datetime]:
-    if getattr(entry, "published_parsed", None):
-        try:
-            return datetime.fromtimestamp(time.mktime(entry.published_parsed), tz=timezone.utc)
-        except Exception:
-            pass
-
-    if getattr(entry, "updated_parsed", None):
-        try:
-            return datetime.fromtimestamp(time.mktime(entry.updated_parsed), tz=timezone.utc)
-        except Exception:
-            pass
-
-    for field in ["published", "updated", "created"]:
-        value = getattr(entry, field, None)
+def parse_entry_date(entry):
+    for key in ["published", "updated", "pubDate"]:
+        value = entry.get(key)
         if value:
             try:
-                dt = parsedate_to_datetime(value)
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone.utc)
-                return dt.astimezone(timezone.utc)
+                return parsedate_to_datetime(value)
             except Exception:
-                continue
+                pass
+    return datetime.now(timezone.utc)
 
-    return None
+def fetch_articles():
+    articles = []
 
-
-# =========================
-# CATEGORY + SCORE
-# =========================
-def categorize_article(title: str, summary: str) -> str:
-    text = f"{title} {summary}".lower()
-    scores: Dict[str, int] = {}
-
-    for category, keywords in CATEGORY_RULES.items():
-        score = 0
-        for kw in keywords:
-            if kw in text:
-                score += 1
-        scores[category] = score
-
-    best_category = max(scores, key=scores.get)
-    return best_category if scores[best_category] > 0 else "General"
-
-
-def score_article(title: str, summary: str, category: str) -> int:
-    text = f"{title} {summary}".lower()
-    score = 0
-
-    hot_words = [
-        "breaking", "surge", "plunge", "approval", "reject",
-        "hack", "exploit", "etf", "sec", "listing", "airdrop",
-        "mainnet", "lawsuit", "liquidation", "whale"
-    ]
-
-    for word in hot_words:
-        if word in text:
-            score += 2
-
-    if category != "General":
-        score += 2
-
-    if len(summary) > 120:
-        score += 1
-
-    return score
-
-
-# =========================
-# RSS FETCH
-# =========================
-def fetch_articles() -> List[Dict[str, Any]]:
-    now = datetime.now(timezone.utc)
-    cutoff = now - timedelta(hours=LOOKBACK_HOURS)
-    sources = load_sources()
-    all_items: List[Dict[str, Any]] = []
-
-    log(f"[INFO] Fetching RSS from {len(sources)} sources | cutoff={cutoff.isoformat()}")
-
-    for source in sources:
-        source_name = source["name"]
-        feed_url = source["rss"]
-
+    for feed_url in RSS_FEEDS:
         try:
             feed = feedparser.parse(feed_url)
+            for entry in feed.entries[:MAX_ARTICLES_TO_FETCH]:
+                title = (entry.get("title") or "").strip()
+                link = (entry.get("link") or "").strip()
+                summary = (entry.get("summary") or entry.get("description") or "").strip()
+                published_at = parse_entry_date(entry)
+
+                if not title or not link:
+                    continue
+
+                articles.append({
+                    "id": make_article_id(link, title),
+                    "title": title,
+                    "link": link,
+                    "summary": summary,
+                    "published_at": published_at.isoformat()
+                })
         except Exception as e:
-            log(f"[WARN] Failed to parse {source_name}: {e}")
-            continue
+            print(f"[WARN] Failed feed {feed_url}: {e}")
 
-        entry_count = 0
+    # sort mới nhất trước
+    articles.sort(key=lambda x: x["published_at"], reverse=True)
+    return articles
 
-        for entry in feed.entries:
-            title = strip_html(getattr(entry, "title", "").strip())
-            link = getattr(entry, "link", "").strip()
-            summary = getattr(entry, "summary", "") or getattr(entry, "description", "")
-
-            if not title or not link:
-                continue
-
-            published_at = parse_entry_time(entry)
-            if published_at is None or published_at < cutoff:
-                continue
-
-            clean_snippet = strip_html(summary)
-            category = categorize_article(title, clean_snippet)
-            score = score_article(title, clean_snippet, category)
-
-            item = {
-                "id": make_item_id(title, link),
-                "source": source_name,
-                "title": title,
-                "link": normalize_url(link),
-                "summary": truncate_text(clean_snippet, 350),
-                "published_at": published_at,
-                "category": category,
-                "score": score,
-            }
-            all_items.append(item)
-            entry_count += 1
-
-        log(f"[INFO] {source_name}: kept {entry_count} items")
-
-    dedup_by_link: Dict[str, Dict[str, Any]] = {}
-    for item in all_items:
-        old = dedup_by_link.get(item["link"])
-        if old is None or item["score"] > old["score"]:
-            dedup_by_link[item["link"]] = item
-
-    items = list(dedup_by_link.values())
-    items.sort(key=lambda x: (x["score"], x["published_at"]), reverse=True)
-
-    log(f"[INFO] Total fetched after dedup: {len(items)}")
-    return items
-
-
-def limit_items_balanced(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    grouped: Dict[str, List[Dict[str, Any]]] = {}
-    ordered_categories = ["Market", "Regulation", "DeFi", "Security", "Alt & Ecosystem", "General"]
-
-    for item in items:
-        grouped.setdefault(item["category"], []).append(item)
-
-    selected: List[Dict[str, Any]] = []
-
-    for category in ordered_categories:
-        if category not in grouped:
-            continue
-
-        bucket = sorted(
-            grouped[category],
-            key=lambda x: (x["score"], x["published_at"]),
-            reverse=True
-        )
-        selected.extend(bucket[:MAX_PER_CATEGORY])
-
-    selected.sort(
-        key=lambda x: (x["score"], x["published_at"]),
-        reverse=True
-    )
-
-    final_items: List[Dict[str, Any]] = []
-    seen_title_keys = set()
-
-    for item in selected:
-        title_key = re.sub(r"[^a-z0-9]+", " ", item["title"].lower()).strip()
-        title_key = " ".join(title_key.split()[:8])
-
-        if title_key in seen_title_keys:
-            continue
-
-        seen_title_keys.add(title_key)
-        final_items.append(item)
-
-        if len(final_items) >= MAX_ITEMS:
+def pick_unsent_articles(articles, sent_ids):
+    fresh = []
+    for a in articles:
+        if a["id"] not in sent_ids:
+            fresh.append(a)
+        if len(fresh) >= MAX_ARTICLES_TO_SUMMARIZE:
             break
+    return fresh
 
-    log(f"[INFO] Selected balanced items: {len(final_items)}")
-    return final_items
+def summarize_with_deepseek(articles):
+    """
+    Tạo 1 bản tin tiếng Việt ngắn gọn, dễ đọc, tránh lặp ý.
+    """
+    if not articles:
+        return "Hiện chưa có tin mới đáng chú ý trong khung giờ này."
 
-
-# =========================
-# GEMINI DIGEST
-# =========================
-def build_gemini_client():
-    if not GEMINI_API_KEY:
-        raise RuntimeError("Missing GEMINI_API_KEY")
-    return genai.Client(api_key=GEMINI_API_KEY)
-
-
-def build_digest_prompt(items: List[Dict[str, Any]]) -> str:
-    total_items = len(items)
-    news_blocks = []
-
-    for i, item in enumerate(items, start=1):
-        news_blocks.append(
-            (
-                f"TIN {i}\n"
-                f"Nguồn: {item['source']}\n"
-                f"Mục: {CATEGORY_LABEL_VI.get(item['category'], 'Tổng hợp')}\n"
-                f"Giờ: {format_time_vn(item['published_at'])}\n"
-                f"Tiêu đề: {item['title']}\n"
-                f"Nội dung: {item['summary']}"
-            )
+    source_text = []
+    for i, a in enumerate(articles, 1):
+        source_text.append(
+            f"[{i}] {a['title']}\n"
+            f"Link: {a['link']}\n"
+            f"Tóm tắt gốc: {a['summary'][:1200]}\n"
         )
 
-    joined = "\n\n".join(news_blocks)
+    prompt = f"""
+Bạn là biên tập viên bản tin crypto.
 
-    return f"""
-Viết bản tin crypto tiếng Việt cho Discord từ danh sách dưới đây.
+Nhiệm vụ:
+- Viết bản tin tiếng Việt tự nhiên, dễ đọc.
+- Chỉ dùng thông tin từ các bài bên dưới.
+- Không bịa thêm dữ kiện.
+- Không lặp ý giữa các mục.
+- Ưu tiên nêu tác động thị trường / hệ sinh thái nếu có.
+- Văn phong gọn, rõ, hiện đại.
+- Có tiêu đề tổng.
+- Có phần "Điểm nhanh".
+- Có 3-5 gạch đầu dòng.
+- Cuối bản tin thêm mục "Nguồn tham khảo" và liệt kê link theo số [1], [2]...
+- Tổng độ dài khoảng 400-700 từ.
 
-BẮT BUỘC:
-- Dùng đủ đúng {total_items} tin.
-- Kết quả phải có đúng {total_items} bullet, mỗi bullet bắt đầu bằng "•".
-- Không bỏ sót tin.
-- Không gộp nhiều tin làm một.
-- 100% tiếng Việt, trừ tên riêng bắt buộc như Bitcoin, Ethereum, SEC, ETF, Tether, Solana, Coinbase.
-- Mỗi tin 1 đến 2 câu ngắn.
-- Không dùng câu sáo rỗng.
-- Không thêm mở đầu hoặc kết luận.
+Dữ liệu bài viết:
+{chr(10).join(source_text)}
+"""
 
-Nhóm theo mục nếu phù hợp:
-📈 Thị trường
-⚖️ Pháp lý
-🏦 DeFi
-🛡️ Bảo mật
-🧩 Hệ sinh thái
-📰 Tổng hợp
-
-Mỗi tin theo mẫu:
-• [Tiêu đề tiếng Việt]
-[Tóm tắt]
-Nguồn: [Tên nguồn] • [Thời gian]
-
-DANH SÁCH:
-{joined}
-""".strip()
-
-
-def call_gemini_once(client, items: List[Dict[str, Any]], max_output_tokens: int) -> str:
-    prompt = build_digest_prompt(items)
-
-    response = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            temperature=0.2,
-            max_output_tokens=max_output_tokens,
-        ),
+    resp = client.chat.completions.create(
+        model="deepseek-chat",
+        messages=[
+            {"role": "system", "content": "Bạn là một editor chuyên viết bản tin crypto bằng tiếng Việt."},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.4,
+        max_tokens=1800
     )
 
-    return cleanup_digest_text((response.text or "").strip())
+    return resp.choices[0].message.content.strip()
 
+def send_to_discord(content: str):
+    if not DISCORD_WEBHOOK_URL:
+        raise ValueError("Missing DISCORD_WEBHOOK_URL")
 
-def generate_digest_text(client, items: List[Dict[str, Any]]) -> str:
-    if not items:
-        return f"Không có tin mới nổi bật trong {LOOKBACK_HOURS} giờ gần đây."
+    # Discord giới hạn content ngắn, nên cắt thành nhiều phần nếu cần
+    chunks = split_message(content, 1800)
+    for chunk in chunks:
+        payload = {
+            "content": chunk,
+            "allowed_mentions": {"parse": []}
+        }
+        r = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=30)
+        r.raise_for_status()
+        time.sleep(1)
 
-    if client is None:
-        raise RuntimeError("Gemini client is not available")
-
-    expected_bullets = len(items)
-    log(f"[INFO] Sending {expected_bullets} items to Gemini with model={GEMINI_MODEL}")
-
-    try:
-        text = call_gemini_once(client, items, max_output_tokens=1200)
-    except Exception as e:
-        raise RuntimeError(f"Gemini API call failed: {e}")
-
-    log("[DEBUG] Gemini raw output preview:")
-    log(text[:1200] if text else "[EMPTY]")
-
-    if not text:
-        raise RuntimeError("Gemini returned empty digest")
-
-    bullet_count = count_bullets(text)
-    log(f"[CHECK] bullet_count={bullet_count} | expected={expected_bullets}")
-
-    if STRICT_VIETNAMESE and not is_digest_mostly_vietnamese(text):
-        raise RuntimeError("Digest is still mostly English")
-
-    if bullet_count >= expected_bullets:
-        return text
-
-    # fallback tiết kiệm quota: chỉ gọi thêm 1 lần với ít tin hơn
-    if len(items) > 2:
-        smaller_items = items[: min(4, len(items))]
-        fallback_expected = len(smaller_items)
-        log(f"[WARN] Too few bullets, fallback with fewer items: {fallback_expected}")
-
-        try:
-            smaller_text = call_gemini_once(client, smaller_items, max_output_tokens=900)
-        except Exception as e:
-            raise RuntimeError(f"Fallback Gemini call failed: {e}")
-
-        log("[DEBUG] Gemini fallback output preview:")
-        log(smaller_text[:1200] if smaller_text else "[EMPTY]")
-
-        if not smaller_text:
-            raise RuntimeError("Fallback Gemini returned empty digest")
-
-        smaller_bullet_count = count_bullets(smaller_text)
-        log(f"[CHECK] fallback_bullet_count={smaller_bullet_count} | expected={fallback_expected}")
-
-        if STRICT_VIETNAMESE and not is_digest_mostly_vietnamese(smaller_text):
-            raise RuntimeError("Fallback digest is still mostly English")
-
-        if smaller_bullet_count >= fallback_expected:
-            return smaller_text
-
-        raise RuntimeError(
-            f"Digest returned too few items: got {bullet_count}, fallback got {smaller_bullet_count}"
-        )
-
-    raise RuntimeError(f"Digest returned too few items: got {bullet_count}, expected {expected_bullets}")
-
-
-# =========================
-# DISCORD FORMAT
-# =========================
-def split_text_for_embeds(text: str, max_len: int = 3800) -> List[str]:
-    text = text.strip()
-    if len(text) <= max_len:
+def split_message(text: str, limit: int = 1800):
+    if len(text) <= limit:
         return [text]
 
-    parts: List[str] = []
+    parts = []
     current = ""
-
-    for block in text.split("\n\n"):
-        block = block.strip()
-        if not block:
-            continue
-
-        candidate = block if not current else f"{current}\n\n{block}"
-        if len(candidate) <= max_len:
-            current = candidate
+    for line in text.splitlines(True):
+        if len(current) + len(line) > limit:
+            parts.append(current)
+            current = line
         else:
-            if current:
-                parts.append(current)
-
-            if len(block) <= max_len:
-                current = block
-            else:
-                for i in range(0, len(block), max_len):
-                    chunk = block[i:i + max_len].strip()
-                    if chunk:
-                        parts.append(chunk)
-                current = ""
+            current += line
 
     if current:
         parts.append(current)
 
-    return parts[:5]
+    return parts
 
-
-def build_discord_payload_from_digest(digest_text: str, items_count: int) -> Dict[str, Any]:
-    current_time = now_vn_str()
-    digest_text = cleanup_digest_text(digest_text)
-
-    chunks = split_text_for_embeds(digest_text, max_len=3800)
-    embeds = []
-
-    for idx, chunk in enumerate(chunks, start=1):
-        embed = {
-            "title": f"Crypto Daily Brief | {current_time}" if idx == 1 else f"Crypto Daily Brief | phần {idx}",
-            "description": chunk,
-            "color": EMBED_COLOR,
-            "footer": {
-                "text": f"{items_count} tin • RSS + Gemini • Auto digest"
-            },
-            "timestamp": datetime.now(timezone.utc).isoformat()
-        }
-        embeds.append(embed)
-
-    return {
-        "content": "📰 **Bản tin crypto 2 kỳ mỗi ngày**",
-        "embeds": embeds[:3]
-    }
-
-
-def send_to_discord(payload: Dict[str, Any]) -> None:
+def main():
+    if not DEEPSEEK_API_KEY:
+        raise ValueError("Missing DEEPSEEK_API_KEY")
     if not DISCORD_WEBHOOK_URL:
-        raise RuntimeError("Missing DISCORD_WEBHOOK_URL")
-
-    response = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=30)
-    if response.status_code not in (200, 204):
-        raise RuntimeError(f"Discord webhook failed: {response.status_code} | {response.text}")
-
-
-# =========================
-# MAIN
-# =========================
-def main() -> None:
-    log("========== BOT START ==========")
-    log(f"[ENV] Has webhook: {bool(DISCORD_WEBHOOK_URL)}")
-    log(f"[ENV] Has gemini key: {bool(GEMINI_API_KEY)}")
-    log(f"[ENV] Model: {GEMINI_MODEL}")
-    log(f"[ENV] Test mode: {TEST_MODE}")
-    log(f"[ENV] Strict Vietnamese: {STRICT_VIETNAMESE}")
-    log(f"[ENV] Lookback hours: {LOOKBACK_HOURS}")
-    log(f"[ENV] Max items: {MAX_ITEMS}")
-    log(f"[ENV] Max per category: {MAX_PER_CATEGORY}")
-
-    if not DISCORD_WEBHOOK_URL:
-        raise RuntimeError("DISCORD_WEBHOOK_URL is missing")
-
-    if not GEMINI_API_KEY:
-        raise RuntimeError("GEMINI_API_KEY is missing")
+        raise ValueError("Missing DISCORD_WEBHOOK_URL")
 
     state = load_state()
-    posted_ids = set(state.get("posted_ids", []))
-    log(f"[INFO] Existing posted_ids: {len(posted_ids)}")
+    sent_ids = set(state.get("sent_ids", []))
 
-    all_items = fetch_articles()
+    articles = fetch_articles()
+    unsent = pick_unsent_articles(articles, sent_ids)
 
-    if TEST_MODE:
-        candidate_items = limit_items_balanced(all_items)
-    else:
-        unseen_items = [item for item in all_items if item["id"] not in posted_ids]
-        log(f"[INFO] Unseen items: {len(unseen_items)}")
-        candidate_items = limit_items_balanced(unseen_items)
-
-    if not candidate_items:
-        log("[INFO] No candidate items")
-        digest_text = f"Không có tin mới nổi bật trong {LOOKBACK_HOURS} giờ gần đây."
-        payload = build_discord_payload_from_digest(digest_text, 0)
-        send_to_discord(payload)
-        log("[INFO] Sent empty digest")
+    if not unsent:
+        send_to_discord("📰 Khung giờ này chưa có bài crypto mới nổi bật để tổng hợp.")
         return
 
-    for idx, item in enumerate(candidate_items, start=1):
-        log(f"[ITEM {idx}] {item['source']} | {item['category']} | {item['title'][:120]}")
+    newsletter = summarize_with_deepseek(unsent)
 
-    client = build_gemini_client()
-    digest_text = generate_digest_text(client, candidate_items)
+    now_vn = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    final_text = f"🪙 **BẢN TIN CRYPTO**\nCập nhật: {now_vn}\n\n{newsletter}"
 
-    sent_items_count = count_bullets(digest_text) or len(candidate_items)
-    payload = build_discord_payload_from_digest(digest_text, sent_items_count)
-    send_to_discord(payload)
-    log("[INFO] Discord message sent successfully")
+    send_to_discord(final_text)
 
-    if not TEST_MODE:
-        for item in candidate_items:
-            posted_ids.add(item["id"])
+    for a in unsent:
+        sent_ids.add(a["id"])
 
-        state["posted_ids"] = list(posted_ids)[-1500:]
-        save_state(state)
-        log(f"[INFO] State saved with {len(state['posted_ids'])} ids")
-    else:
-        log("[INFO] TEST_MODE enabled, state not updated")
-
-    log("========== BOT END ==========")
-
+    # chỉ giữ tối đa 500 id gần nhất cho gọn
+    state["sent_ids"] = list(sent_ids)[-500:]
+    save_state(state)
 
 if __name__ == "__main__":
     main()
