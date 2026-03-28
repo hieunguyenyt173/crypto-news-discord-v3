@@ -1,50 +1,29 @@
-name: Crypto News to Discord V3
+name: Crypto News Bot
 
 on:
-  schedule:
-    - cron: "0 1 * * *"
-    - cron: "0 13 * * *"
   workflow_dispatch:
-
-permissions:
-  contents: write
+  schedule:
+    - cron: '0 1 * * *'   # 08:00 sáng Việt Nam
+    - cron: '0 13 * * *'  # 20:00 tối Việt Nam
 
 jobs:
-  run-news-bot:
+  run-bot:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Ensure state file exists
-        run: |
-          if [ ! -f posted_state.json ]; then
-            echo '{"posted_ids":[]}' > posted_state.json
-          fi
-
       - name: Run bot
         env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          LOOKBACK_HOURS: "12"
-          MAX_ITEMS: "8"
-          MAX_PER_CATEGORY: "2"
-          GEMINI_MODEL: "gemini-2.5-flash"
         run: python main.py
-
-      - name: Commit updated state
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add posted_state.json
-          git diff --cached --quiet || git commit -m "Update posted news state"
-          git push
