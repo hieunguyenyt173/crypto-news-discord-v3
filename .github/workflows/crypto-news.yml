@@ -3,8 +3,10 @@ name: Crypto News Bot V2.1
 on:
   workflow_dispatch:
   schedule:
-    - cron: '0 1 * * *'
-    - cron: '0 13 * * *'
+    - cron: '0 8 * * *'
+      timezone: 'Asia/Ho_Chi_Minh'
+    - cron: '0 20 * * *'
+      timezone: 'Asia/Ho_Chi_Minh'
 
 jobs:
   run-news-bot:
@@ -24,6 +26,11 @@ jobs:
 
       - name: Install dependencies
         run: pip install -r requirements.txt
+
+      - name: Show current time
+        run: |
+          echo "UTC now: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          TZ=Asia/Ho_Chi_Minh date '+VN now: %Y-%m-%d %H:%M:%S GMT+7'
 
       - name: Run bot
         env:
